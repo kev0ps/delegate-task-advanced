@@ -10,6 +10,12 @@ hermes plugins install kev0ps/delegate-task-advanced --enable
 
 Restart the gateway, then start a new session or use `/reset`.
 
+## What it does
+
+`delegate_task_advanced` launches one named Hermes subagent with per-call skill injection, selected child toolsets, and an optional model from the parent provider. It uses Hermes' native subagent lifecycle and delegation settings, while leaving the existing `delegate_task` tool unchanged.
+
+Use it when a task needs a specialized child agent—for example, a named code reviewer with a review skill, a specific model, and a focused set of toolsets.
+
 ## V1 contract
 
 ```json
@@ -34,18 +40,6 @@ Restart the gateway, then start a new session or use `/reset`.
 - Final results use the existing `async_delegation` completion queue.
 - Completion delivery is reserved **before** launch, so a capacity rejection cannot leave an orphaned child.
 - The plugin adds no depth or fan-out ceiling. Configuration and cost remain the user’s responsibility, as with `delegate_task`.
-
-## Hermes-governed orchestration
-
-Advanced does not read, copy, or reimplement any depth logic. It passes `role="orchestrator"` to the public lifecycle, then returns `requested_role`, `effective_role`, and `depth` from the handle produced by Hermes.
-
-```yaml
-delegation:
-  max_spawn_depth: 2
-  orchestrator_enabled: true
-```
-
-With `max_spawn_depth: 1` or `orchestrator_enabled: false`, Hermes downgrades the child to `leaf`. With a depth of 2 or greater, the child can use native delegation within the limits enforced by Hermes. High depth or concurrency values can quickly multiply the number of agents and API calls; the plugin deliberately applies the same global settings without adding another limit.
 
 ## Choosing Advanced or `delegate_task`
 
