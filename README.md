@@ -2,6 +2,14 @@
 
 An additive Hermes Agent plugin that registers `delegate_task_advanced` without modifying the native `delegate_task` tool.
 
+## Installation
+
+```bash
+hermes plugins install kev0ps/delegate-task-advanced --enable
+```
+
+Restart the gateway, then start a new session or use `/reset`.
+
 ## V1 contract
 
 ```json
@@ -106,22 +114,6 @@ This plugin deliberately remains plugin-only: it does not modify `/opt/hermes`, 
 
 These limitations are preferable to fragile workarounds around private APIs.
 
-## Installation
-
-From GitHub:
-
-```bash
-hermes plugins install kev0ps/delegate-task-advanced --enable
-```
-
-Hermes installs the plugin in the active profile’s `plugins/` directory. If it was installed without `--enable`, enable it afterward:
-
-```bash
-hermes plugins enable delegate-task-advanced
-```
-
-The parent `delegation` toolset must be enabled for the relevant platform. Restart the gateway or open a new session after changing the plugin or its configuration.
-
 ## Compatibility
 
 Version `1.0.0` targets the public plugin API available in Hermes Agent `v0.20.5`. Later Hermes versions may evolve the public subagent lifecycle.
@@ -129,12 +121,3 @@ Version `1.0.0` targets the public plugin API available in Hermes Agent `v0.20.5
 ## License
 
 Distributed under the [MIT License](LICENSE).
-
-## Validation
-
-```bash
-PYTHONPATH=/opt/hermes /opt/hermes/.venv/bin/python -m unittest discover -s tests -v
-hermes plugins doctor . --ci
-```
-
-The first smoke test should use public, non-secret content and must not be presented as proof of read-only confinement.
