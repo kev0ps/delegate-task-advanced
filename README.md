@@ -97,23 +97,6 @@ delegation = delegate_task + delegate_task_advanced
 
 Do not add `delegate_task_advanced` directly to `platform_toolsets.*`. Those keys contain **toolset names**, not tool names. Enabling `delegation` is sufficient.
 
-## No custom child toolset in V1
-
-V1 does not provide a read-only file lane. The child `toolsets` parameter selects a baseline from toolsets already provided by Hermes and enabled for the parent. This selection is not a boundary against delegation: when Hermes grants `orchestrator`, the runtime deliberately adds `delegation` even when that name was not requested.
-
-The Hermes `file` toolset includes write and patch capabilities. Selecting it is **not** a read-only guarantee. An instruction telling the model not to modify anything remains an instruction, not a security boundary. Real read-only isolation must rely on a future public and auditable API or toolset; this plugin does not simulate it through registry mutation, private proxies, or monkey-patching.
-
-## Hermes v0.20.5 public API limitations
-
-This plugin deliberately remains plugin-only: it does not modify `/opt/hermes`, import private registries, or monkey-patch the runtime.
-
-- Hermes validates `SubagentLaunchRequest.metadata`, but does not yet preserve it in the lifecycle handle or registry. The plugin therefore keeps the display name, skills, toolsets, and correlation data in the launch acknowledgement and available public surfaces.
-- The public API does not expose the child progress callback. The live transcript created by the plugin contains its header and terminal result, but not the detailed stream of child tool calls. Activity and the latest tool remain visible through the shared Hermes registry.
-- `SubagentLaunchRequest` exposes `model`, but not `provider`. An `openai-codex` parent can therefore launch `gpt-5.6-luna` instead of `gpt-5.6-sol`, but cannot use this path to launch an OpenRouter or Anthropic model.
-- The async completion event records the requested orchestrator role. The launch acknowledgement reports the effective role and depth returned by Hermes, including any downgrade to `leaf` caused by global configuration.
-
-These limitations are preferable to fragile workarounds around private APIs.
-
 ## Compatibility
 
 Version `1.0.0` targets the public plugin API available in Hermes Agent `v0.20.5`. Later Hermes versions may evolve the public subagent lifecycle.
