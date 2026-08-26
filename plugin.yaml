@@ -1,0 +1,13 @@
+name: delegate-task-advanced
+version: "1.0.0"
+description: "One named subagent with explicit skills, narrowed toolsets, same-provider model selection, and Hermes-configured spawning depth."
+author: "Hermes Agent"
+manifest_version: 2
+api_version: 1
+license: MIT
+provides_tools:
+  - delegate_task_advanced
+tags:
+  - delegation
+  - subagents
+  - security
