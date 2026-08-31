@@ -48,20 +48,20 @@ Use it when a task needs a specialized child agent—for example, a named code r
 | Capability | Native `delegate_task` | `delegate_task_advanced` |
 |---|---|---|
 | Primary use | General delegation, orchestration, and validated review | One named, specialized child |
-| Single child | Yes | Yes |
-| Human-readable display name | No dedicated field | Yes — `name` |
-| Per-call skill injection | No | Yes — `skills` |
-| Per-call toolset selection | No | Yes — `toolsets` |
-| Per-call model selection | No | Yes — `model`, within the parent provider |
-| Per-call provider selection | No | No |
-| Parallel batch with `tasks` | Yes, with consolidated completion | No; use separate Advanced calls |
-| Validated `output_schema` | Yes | No |
-| Per-call role selection | `leaf` or `orchestrator` | No; the plugin requests `orchestrator` and Hermes decides the effective role |
-| Per-call depth selection | No | No |
+| Single child | ✅ | ✅ |
+| Human-readable display name | ❌ | ✅ `name` |
+| Per-call skill injection | ❌ | ✅ `skills` |
+| Per-call toolset selection | ❌ | ✅ `toolsets` |
+| Per-call model selection | ❌ | ✅ `model`, within the parent provider |
+| Per-call provider selection | ❌ | ❌ |
+| Parallel batch with `tasks` | ✅ Consolidated completion | ❌ Use separate Advanced calls |
+| Validated `output_schema` | ✅ | ❌ |
+| Per-call role selection | ✅ `leaf` or `orchestrator` | ❌ The plugin requests `orchestrator`; Hermes decides the effective role |
+| Per-call depth selection | ❌ | ❌ |
 | Depth limit | Global `delegation.max_spawn_depth` | Global `delegation.max_spawn_depth` |
-| `list`, `steer`, and `stop` | Yes | Yes, through the shared native subagent registry |
+| `list`, `steer`, and `stop` | ✅ | ✅ Through the shared native subagent registry |
 | Completion delivery | Standard async completion queue | Same standard async completion queue |
-| Read-only guarantee from `file` | No — `file` also includes write and patch tools | No — toolset selection is not per-tool sandboxing |
+| Read-only guarantee from `file` | ❌ `file` also includes write and patch tools | ❌ Toolset selection is not per-tool sandboxing |
 
 Use native `delegate_task` for simple delegation, batches, explicit role selection, or fail-closed structured review. Use Advanced for a single child whose name, injected skills, baseline toolsets, or same-provider model materially improve the mission.
 
