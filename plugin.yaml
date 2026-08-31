@@ -1,6 +1,6 @@
 name: delegate-task-advanced
-version: "1.0.0"
-description: "One named subagent with explicit skills, narrowed toolsets, same-provider model selection, and Hermes-configured spawning depth."
+version: "1.1.0"
+description: "One named subagent with roles, skills, toolsets, model selection, and validated output schemas."
 author: "Hermes Agent"
 manifest_version: 2
 api_version: 1
