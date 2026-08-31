@@ -41,17 +41,29 @@ Use it when a task needs a specialized child agent—for example, a named code r
 - Completion delivery is reserved **before** launch, so a capacity rejection cannot leave an orphaned child.
 - The plugin adds no depth or fan-out ceiling. Configuration and cost remain the user’s responsibility, as with `delegate_task`.
 
-## Choosing Advanced or `delegate_task`
+## Advanced vs native `delegate_task`
 
-`delegate_task_advanced` is not a general replacement for the native tool. It is intended for **one named child**, whose ability to delegate follows Hermes configuration, when the call needs at least one Advanced differentiator: explicit skill injection, child toolset selection, or a different model within the parent provider.
+`delegate_task_advanced` is not a general replacement for the native tool. Use it when one focused child needs at least one Advanced differentiator: a display name, explicit skill injection, selected baseline toolsets, or a same-provider model override.
 
-| Need | Recommended tool |
-|---|---|
-| One named child with skills, selected toolsets, a same-provider model, or globally governed orchestration | `delegate_task_advanced` |
-| Simple delegation with no Advanced differentiator | `delegate_task` |
-| Multiple tasks or a parallel batch | `delegate_task` |
-| `output_schema` validation | `delegate_task` |
-| `list`, `steer`, or `stop` controls | `delegate_task` |
+| Capability | Native `delegate_task` | `delegate_task_advanced` |
+|---|---|---|
+| Primary use | General delegation, orchestration, and validated review | One named, specialized child |
+| Single child | ✅ | ✅ |
+| Human-readable display name | ❌ | ✅ `name` |
+| Per-call skill injection | ❌ | ✅ `skills` |
+| Per-call toolset selection | ❌ | ✅ `toolsets` |
+| Per-call model selection | ❌ | ✅ `model`, within the parent provider |
+| Per-call provider selection | ❌ | ❌ |
+| Parallel batch with `tasks` | ✅ Consolidated completion | ❌ Use separate Advanced calls |
+| Validated `output_schema` | ✅ | ❌ |
+| Per-call role selection | ✅ `leaf` or `orchestrator` | ❌ The plugin requests `orchestrator`; Hermes decides the effective role |
+| Per-call depth selection | ❌ | ❌ |
+| Depth limit | Global `delegation.max_spawn_depth` | Global `delegation.max_spawn_depth` |
+| `list`, `steer`, and `stop` | ✅ | ✅ Through the shared native subagent registry |
+| Completion delivery | Standard async completion queue | Same standard async completion queue |
+| Read-only guarantee from `file` | ❌ `file` also includes write and patch tools | ❌ Toolset selection is not per-tool sandboxing |
+
+Use native `delegate_task` for simple delegation, batches, explicit role selection, or fail-closed structured review. Use Advanced for a single child whose name, injected skills, baseline toolsets, or same-provider model materially improve the mission.
 
 An Advanced call immediately returns a launch acknowledgement. The final result later returns through the Hermes completion queue; do not wait or poll after launch.
 
