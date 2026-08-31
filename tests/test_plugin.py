@@ -82,11 +82,9 @@ class FakeContext:
 class PluginTests(unittest.TestCase):
     def setUp(self):
         self.plugin = load_plugin()
+        self.plugin_module = sys.modules[f"{self.plugin.__name__}.plugin"]
 
-    def tearDown(self):
-        pass
-
-    def test_registers_only_additive_tool_without_custom_toolset(self):
+    def test_register_adds_advanced_tool_without_touching_native_delegation(self):
         ctx = FakeContext()
         from toolsets import TOOLSETS
         from tools.delegate_tool import DELEGATE_TASK_SCHEMA, delegate_task
@@ -104,7 +102,13 @@ class PluginTests(unittest.TestCase):
         self.assertIs(delegate_task, original_delegate_handler)
         self.assertEqual(ctx.unload_callbacks, [])
 
-    def test_schema_delegates_orchestration_depth_to_hermes_config(self):
+    def test_package_init_exports_only_the_public_register_hook(self):
+        source = inspect.getsource(self.plugin)
+        self.assertIn("def register(", source)
+        self.assertNotIn("def make_handler(", source)
+        self.assertNotIn("SubagentLaunchRequest", source)
+
+    def test_schema_omits_provider_tuning_and_batch_fields(self):
         ctx = FakeContext()
         self.plugin.register(ctx)
         params = ctx.tools[0]["schema"]["parameters"]
@@ -113,10 +117,13 @@ class PluginTests(unittest.TestCase):
         self.assertIn("model", params["properties"])
         self.assertNotIn("provider", params["properties"])
         self.assertNotIn("reasoning_effort", params["properties"])
-        self.assertNotIn("role", params["properties"])
+        self.assertEqual(params["properties"]["role"]["enum"], ["leaf", "orchestrator"])
+        self.assertNotIn("tasks", params["properties"])
+        self.assertIn("output_schema", params["properties"])
         description = ctx.tools[0]["schema"]["description"]
-        self.assertIn("delegation.max_spawn_depth", description)
-        self.assertIn("delegation.orchestrator_enabled", description)
+        role_description = ctx.tools[0]["schema"]["parameters"]["properties"]["role"]["description"]
+        self.assertIn("delegation.max_spawn_depth", role_description)
+        self.assertIn("delegation.orchestrator_enabled", role_description)
 
     def test_schema_describes_selection_and_security_boundaries(self):
         ctx = FakeContext()
@@ -126,16 +133,16 @@ class PluginTests(unittest.TestCase):
         properties = tool["schema"]["parameters"]["properties"]
 
         for phrase in (
-            "exactly one",
-            "requests the orchestrator role",
+            "one named Hermes subagent",
             "fresh conversation",
-            "not individual tool names",
-            "do not imply read-only access",
-            "cannot switch providers",
-            "do not wait or poll",
-            "use the native delegate_task",
+            "returns immediately",
         ):
             self.assertIn(phrase, description)
+        toolsets_description = properties["toolsets"]["description"]
+        self.assertIn("not individual tool names", toolsets_description)
+        self.assertIn("do not imply read-only access", toolsets_description)
+        model_description = properties["model"]["description"]
+        self.assertIn("cannot switch providers", model_description)
 
         self.assertIn("not the generated subagent_id", properties["name"]["description"])
         self.assertIn("cannot see the parent conversation", properties["goal"]["description"])
@@ -144,8 +151,137 @@ class PluginTests(unittest.TestCase):
         self.assertIn("do not imply read-only access", properties["toolsets"]["description"])
         self.assertIn("orchestrator adds delegation", properties["toolsets"]["description"])
         self.assertIn("cannot switch providers", properties["model"]["description"])
-        self.assertIn("Hermes-configured spawning depth", tool["description"])
-        self.assertIn("use native delegate_task", tool["description"])
+        self.assertIn("one named Hermes subagent", tool["description"])
+        self.assertIn("delegation depth", tool["description"])
+
+    def test_explicit_leaf_role_is_forwarded_to_lifecycle(self):
+        ctx = FakeContext()
+        self.plugin.register(ctx)
+        handler = ctx.tools[0]["handler"]
+        with patch.object(self.plugin_module, "dispatch_completion_watcher", return_value={
+            "status": "dispatched", "delegation_id": "deleg-test"
+        }) as watcher:
+            payload = json.loads(handler({
+                "name": "Leaf reviewer", "goal": "Review", "role": "leaf"
+            }))
+
+        self.assertTrue(payload["success"])
+        self.assertEqual(payload["requested_role"], "leaf")
+        self.assertEqual(ctx.subagent_lifecycle.requests[0].role, "leaf")
+        self.assertEqual(watcher.call_args.kwargs["role"], "leaf")
+
+    def test_batch_tasks_field_is_rejected(self):
+        ctx = FakeContext()
+        self.plugin.register(ctx)
+        handler = ctx.tools[0]["handler"]
+        payload = json.loads(handler({
+            "tasks": [
+                {"name": "Security", "goal": "Analyze security risks"},
+                {"name": "Logic", "goal": "Analyze logic regressions"},
+            ],
+        }))
+
+        self.assertFalse(payload["success"])
+        self.assertIn("Unknown fields: tasks", payload["error"])
+        self.assertEqual(ctx.subagent_lifecycle.requests, [])
+
+    def test_output_schema_is_validated_and_appended_to_child_context(self):
+        ctx = FakeContext()
+        self.plugin.register(ctx)
+        schema = {
+            "type": "object",
+            "properties": {"finding": {"type": "string"}},
+            "required": ["finding"],
+        }
+        with patch.object(self.plugin_module, "dispatch_completion_watcher", return_value={
+            "status": "dispatched", "delegation_id": "deleg-schema"
+        }):
+            payload = json.loads(ctx.tools[0]["handler"]({
+                "name": "Structured", "goal": "Review", "output_schema": schema
+            }))
+
+        self.assertTrue(payload["success"])
+        request = ctx.subagent_lifecycle.requests[0]
+        self.assertIn("OUTPUT CONTRACT (machine-validated)", request.context)
+        result = self.plugin_module.result_payload(
+            ctx.subagent_lifecycle,
+            ctx.subagent_lifecycle.launch(request),
+            "Structured",
+            schema,
+        )
+        self.assertFalse(result["schema_valid"])
+        self.assertTrue(result["schema_errors"])
+
+    def test_invalid_output_schema_fails_before_launch(self):
+        ctx = FakeContext()
+        self.plugin.register(ctx)
+        payload = json.loads(ctx.tools[0]["handler"]({
+            "name": "Structured",
+            "goal": "Review",
+            "output_schema": {"type": "definitely-not-a-json-schema-type"},
+        }))
+        self.assertFalse(payload["success"])
+        self.assertIn("output_schema", payload["error"])
+        self.assertEqual(ctx.subagent_lifecycle.requests, [])
+
+    def test_invalid_structured_result_gets_one_bounded_correction_retry(self):
+        from agent.subagent_lifecycle import SubagentLaunchRequest
+
+        lifecycle = FakeLifecycle()
+        schema = {
+            "type": "object",
+            "properties": {"finding": {"type": "string"}},
+            "required": ["finding"],
+        }
+        request = SubagentLaunchRequest(
+            goal="Return structured finding",
+            context="OUTPUT CONTRACT (machine-validated)",
+            role="leaf",
+            correlation_id="initial",
+            metadata={},
+        )
+        state = self.plugin_module.DeferredLaunch(lifecycle, "Structured", schema)
+        state.retry_request = request
+        state.set_handle(lifecycle.launch(request))
+
+        result = state.run()
+
+        self.assertEqual(len(lifecycle.requests), 2)
+        self.assertEqual(result["schema_retries"], 1)
+        self.assertFalse(result["schema_valid"])
+        self.assertTrue(result["schema_errors"])
+        self.assertIn("Correct the previous final response", lifecycle.requests[1].goal)
+
+    def test_failed_correction_launch_preserves_first_validation_failure(self):
+        from agent.subagent_lifecycle import SubagentLaunchRequest
+
+        lifecycle = FakeLifecycle()
+        request = SubagentLaunchRequest(
+            goal="Return structured finding",
+            context="OUTPUT CONTRACT (machine-validated)",
+            role="leaf",
+            correlation_id="initial",
+            metadata={},
+        )
+        initial_handle = lifecycle.launch(request)
+        lifecycle.launch = lambda _request: (_ for _ in ()).throw(
+            RuntimeError("retry launch failed")
+        )
+        state = self.plugin_module.DeferredLaunch(
+            lifecycle,
+            "Structured",
+            {"type": "object", "required": ["finding"]},
+        )
+        state.retry_request = request
+        state.set_handle(initial_handle)
+
+        result = state.run()
+
+        self.assertEqual(result["status"], "completed")
+        self.assertFalse(result["schema_valid"])
+        self.assertTrue(result["schema_errors"])
+        self.assertEqual(result["schema_retries"], 1)
+        self.assertIn("retry launch failed", result["schema_retry_error"])
 
     def test_optional_model_is_passed_to_native_lifecycle(self):
         ctx = FakeContext()
@@ -155,7 +291,7 @@ class PluginTests(unittest.TestCase):
             session_id="parent-session",
             enabled_toolsets=["delegation", "file"],
         )
-        with patch.object(self.plugin, "_dispatch_completion_watcher", return_value={
+        with patch.object(self.plugin_module, "dispatch_completion_watcher", return_value={
             "status": "dispatched", "delegation_id": "deleg-test"
         }) as watcher:
             payload = json.loads(handler({
@@ -179,7 +315,7 @@ class PluginTests(unittest.TestCase):
         ctx = FakeContext()
         self.plugin.register(ctx)
         handler = ctx.tools[0]["handler"]
-        with patch.object(self.plugin, "_dispatch_completion_watcher", return_value={
+        with patch.object(self.plugin_module, "dispatch_completion_watcher", return_value={
             "status": "dispatched", "delegation_id": "deleg-test"
         }) as watcher:
             payload = json.loads(handler({"name": "Reviewer", "goal": "Review"}))
@@ -213,7 +349,7 @@ class PluginTests(unittest.TestCase):
             session_id="parent-session",
             enabled_toolsets=["delegation", "file"],
         )
-        with patch.object(self.plugin, "_dispatch_completion_watcher", return_value={
+        with patch.object(self.plugin_module, "dispatch_completion_watcher", return_value={
             "status": "dispatched", "delegation_id": "deleg-test"
         }):
             payload = json.loads(handler({
@@ -247,7 +383,7 @@ class PluginTests(unittest.TestCase):
         )
         self.plugin.register(ctx)
         handler = ctx.tools[0]["handler"]
-        with patch.object(self.plugin, "_dispatch_completion_watcher", return_value={
+        with patch.object(self.plugin_module, "dispatch_completion_watcher", return_value={
             "status": "dispatched", "delegation_id": "deleg-test"
         }):
             payload = json.loads(handler({"name": "Reviewer", "goal": "Review"}))
@@ -299,7 +435,7 @@ class PluginTests(unittest.TestCase):
         ctx = FakeContext()
         self.plugin.register(ctx)
         handler = ctx.tools[0]["handler"]
-        with patch.object(self.plugin, "_dispatch_completion_watcher", return_value={
+        with patch.object(self.plugin_module, "dispatch_completion_watcher", return_value={
             "status": "rejected", "error": "capacity"
         }):
             payload = json.loads(handler({"name": "Reviewer", "goal": "Review"}))
@@ -312,7 +448,9 @@ class PluginTests(unittest.TestCase):
         self.plugin.register(ctx)
         handler = ctx.tools[0]["handler"]
         with patch.object(
-            self.plugin, "_dispatch_completion_watcher", side_effect=RuntimeError("queue offline")
+            self.plugin_module,
+            "dispatch_completion_watcher",
+            side_effect=RuntimeError("queue offline"),
         ):
             payload = json.loads(handler({"name": "Reviewer", "goal": "Review"}))
         self.assertFalse(payload["success"])
@@ -337,7 +475,7 @@ class PluginTests(unittest.TestCase):
         ctx.subagent_lifecycle.launch = lambda _request: (_ for _ in ()).throw(
             RuntimeError("launch exploded")
         )
-        with patch.object(self.plugin, "_dispatch_completion_watcher", return_value={
+        with patch.object(self.plugin_module, "dispatch_completion_watcher", return_value={
             "status": "dispatched", "delegation_id": "deleg-test"
         }):
             launch_error = json.loads(handler({"name": "Named reviewer", "goal": "Review"}))
@@ -345,7 +483,7 @@ class PluginTests(unittest.TestCase):
 
     def test_cancellation_before_handle_does_not_orphan_later_launch(self):
         lifecycle = FakeLifecycle()
-        state = self.plugin._DeferredLaunch(lifecycle, "Reviewer")
+        state = self.plugin_module.DeferredLaunch(lifecycle, "Reviewer")
         state.cancel()
         self.assertTrue(state.cancel_requested)
         self.assertIsNone(state.launch_error)
@@ -365,15 +503,16 @@ class PluginTests(unittest.TestCase):
         self.assertIn("toolsets", payload["error"])
 
     def test_source_does_not_define_custom_file_readonly_toolset(self):
-        source = inspect.getsource(self.plugin)
-        self.assertNotIn("file_readonly", source)
+        self.assertNotIn(
+            "file_readonly", inspect.getsource(self.plugin_module)
+        )
 
     def test_async_lifecycle_exception_keeps_human_name(self):
         lifecycle = FakeLifecycle()
         lifecycle.wait = lambda *_args, **_kwargs: (_ for _ in ()).throw(
             RuntimeError("wait exploded")
         )
-        state = self.plugin._DeferredLaunch(lifecycle, "Named reviewer")
+        state = self.plugin_module.DeferredLaunch(lifecycle, "Named reviewer")
         handle = lifecycle.launch(SimpleNamespace(correlation_id="corr"))
         state.set_handle(handle)
         result = state.run()
@@ -382,8 +521,85 @@ class PluginTests(unittest.TestCase):
         self.assertIn("wait exploded", result["error"])
 
     def test_routing_context_does_not_use_private_async_api(self):
-        source = inspect.getsource(self.plugin._routing_context)
+        source = inspect.getsource(self.plugin_module.routing_context)
         self.assertNotIn("_current_origin_session_id", source)
+
+
+
+class PluginModuleMixin(unittest.TestCase):
+    def setUp(self):
+        self.plugin = load_plugin()
+        self.plugin_module = sys.modules[f"{self.plugin.__name__}.plugin"]
+
+
+class InputValidationTests(PluginModuleMixin):
+    def test_normalize_name_list_dedupes_preserving_order(self):
+        self.assertEqual(
+            self.plugin_module.normalize_name_list(["file_readonly", "file_readonly", "web"], "toolsets"),
+            ["file_readonly", "web"],
+        )
+
+    def test_rejects_invalid_names_and_oversized_lists(self):
+        with self.assertRaisesRegex(ValueError, "skills"):
+            self.plugin_module.normalize_name_list(["../secret"], "skills")
+        with self.assertRaisesRegex(ValueError, "at most"):
+            self.plugin_module.normalize_name_list([f"skill-{i}" for i in range(9)], "skills")
+
+    def test_display_name_is_normalized_and_rejects_format_characters(self):
+        self.assertEqual(self.plugin_module.validate_display_name("  Relay reviewer  "), "Relay reviewer")
+        with self.assertRaises(ValueError):
+            self.plugin_module.validate_display_name("**format injection**")
+
+
+class SkillInjectionTests(PluginModuleMixin):
+    def test_appends_framed_skill_context(self):
+        def dispatch(_name, args, **_kwargs):
+            return json.dumps({"success": True, "content": f"content:{args['name']}"})
+
+        context, names = self.plugin_module.build_skill_context(
+            "base", ["alpha", "beta"], dispatch
+        )
+        self.assertEqual(names, ["alpha", "beta"])
+        self.assertIn("base", context)
+        self.assertIn("BEGIN EXPLICIT SKILLS", context)
+        self.assertIn("content:alpha", context)
+
+    def test_retries_skill_view_without_task_id_when_parent_dedup_hides_content(self):
+        calls = []
+
+        def dispatch(_name, args, **kwargs):
+            calls.append((args, kwargs))
+            if kwargs.get("task_id") == "parent-task":
+                return json.dumps({
+                    "success": True,
+                    "status": "unchanged",
+                    "dedup": True,
+                    "content_returned": False,
+                })
+            return json.dumps({"success": True, "content": "# Injected skill"})
+
+        context, names = self.plugin_module.build_skill_context(
+            None,
+            ["alpha"],
+            dispatch,
+            dispatch_kwargs={"task_id": "parent-task", "session_id": "session"},
+        )
+
+        self.assertEqual(names, ["alpha"])
+        self.assertIn("# Injected skill", context)
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[1][1], {"session_id": "session"})
+
+    def test_fails_loudly_on_malformed_or_oversized_skill_payload(self):
+        def malformed(*_args, **_kwargs):
+            return "not-json"
+        with self.assertRaisesRegex(ValueError, "malformed"):
+            self.plugin_module.build_skill_context(None, ["alpha"], malformed)
+
+        def huge(*_args, **_kwargs):
+            return json.dumps({"success": True, "content": "x" * 25000})
+        with self.assertRaisesRegex(ValueError, "limit"):
+            self.plugin_module.build_skill_context(None, ["alpha"], huge, max_chars=100)
 
 
 if __name__ == "__main__":
