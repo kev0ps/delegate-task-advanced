@@ -18,12 +18,12 @@ Restart the gateway, then start a new session or use `/reset`.
 |---|---|---|
 | Primary use | General delegation, orchestration, and validated review | One named, specialized child |
 | Single child | ✅ | ✅ |
-| Human-readable display name | ❌ | ✅ `name` |
-| Per-call skill injection | ❌ | ✅ `skills` |
-| Per-call toolset selection | ❌ | ✅ `toolsets` |
-| Per-call model selection | ❌ | ✅ `model` |
+| Human-readable display `name` | ❌ | ✅ |
+| Per-call `skills` injection | ❌ | ✅ |
+| Per-call `toolsets` selection | ❌ | ✅ |
+| Per-call `model` selection | ❌ | ✅ |
 | Per-call provider selection | ❌ | ❌ |
-| Parallel batch with `tasks` | ✅ | ❌ |
+| Parallel `tasks` batch | ✅ | ❌ |
 | Validated `output_schema` | ✅ | ✅ |
 | Per-call role selection (`leaf`/`orchestrator`) | ✅ | ✅ |
 | Per-call depth selection | ❌ | ❌ |
