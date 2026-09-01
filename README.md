@@ -25,8 +25,6 @@ Restart the gateway, then start a new session or use `/reset`.
 | Per-call provider selection | ❌ | ❌ |
 | Parallel `tasks` batch | ✅ | ❌ |
 | Validated `output_schema` | ✅ | ✅ |
-| Per-call role selection (`leaf`/`orchestrator`) | ✅ | ❌ |
-| Per-call depth selection | ❌ | ❌ |
 | Depth limit (global `delegation.max_spawn_depth`) | ✅ | ✅ |
 | `list`, `steer`, and `stop` | ✅ | ✅ |
 
