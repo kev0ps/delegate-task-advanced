@@ -117,13 +117,24 @@ class PluginTests(unittest.TestCase):
         self.assertIn("model", params["properties"])
         self.assertNotIn("provider", params["properties"])
         self.assertNotIn("reasoning_effort", params["properties"])
-        self.assertEqual(params["properties"]["role"]["enum"], ["leaf", "orchestrator"])
+        self.assertNotIn("role", params["properties"])
         self.assertNotIn("tasks", params["properties"])
         self.assertIn("output_schema", params["properties"])
         description = ctx.tools[0]["schema"]["description"]
-        role_description = ctx.tools[0]["schema"]["parameters"]["properties"]["role"]["description"]
-        self.assertIn("delegation.max_spawn_depth", role_description)
-        self.assertIn("delegation.orchestrator_enabled", role_description)
+        self.assertIn("Hermes decides the subagent role", description)
+
+    def test_role_field_is_rejected_as_unknown_before_launch(self):
+        ctx = FakeContext()
+        self.plugin.register(ctx)
+        handler = ctx.tools[0]["handler"]
+        for role in ("leaf", "orchestrator", None):
+            with self.subTest(role=role):
+                payload = json.loads(handler({
+                    "name": "Reviewer", "goal": "Review", "role": role
+                }))
+                self.assertFalse(payload["success"])
+                self.assertIn("Unknown fields: role", payload["error"])
+        self.assertEqual(ctx.subagent_lifecycle.requests, [])
 
     def test_schema_describes_selection_and_security_boundaries(self):
         ctx = FakeContext()
@@ -149,26 +160,9 @@ class PluginTests(unittest.TestCase):
         self.assertIn("grant no permissions", properties["skills"]["description"])
         self.assertIn("not individual tool names", properties["toolsets"]["description"])
         self.assertIn("do not imply read-only access", properties["toolsets"]["description"])
-        self.assertIn("orchestrator adds delegation", properties["toolsets"]["description"])
         self.assertIn("cannot switch providers", properties["model"]["description"])
         self.assertIn("one named Hermes subagent", tool["description"])
         self.assertIn("delegation depth", tool["description"])
-
-    def test_explicit_leaf_role_is_forwarded_to_lifecycle(self):
-        ctx = FakeContext()
-        self.plugin.register(ctx)
-        handler = ctx.tools[0]["handler"]
-        with patch.object(self.plugin_module, "dispatch_completion_watcher", return_value={
-            "status": "dispatched", "delegation_id": "deleg-test"
-        }) as watcher:
-            payload = json.loads(handler({
-                "name": "Leaf reviewer", "goal": "Review", "role": "leaf"
-            }))
-
-        self.assertTrue(payload["success"])
-        self.assertEqual(payload["requested_role"], "leaf")
-        self.assertEqual(ctx.subagent_lifecycle.requests[0].role, "leaf")
-        self.assertEqual(watcher.call_args.kwargs["role"], "leaf")
 
     def test_batch_tasks_field_is_rejected(self):
         ctx = FakeContext()
@@ -236,7 +230,6 @@ class PluginTests(unittest.TestCase):
         request = SubagentLaunchRequest(
             goal="Return structured finding",
             context="OUTPUT CONTRACT (machine-validated)",
-            role="leaf",
             correlation_id="initial",
             metadata={},
         )
@@ -259,7 +252,6 @@ class PluginTests(unittest.TestCase):
         request = SubagentLaunchRequest(
             goal="Return structured finding",
             context="OUTPUT CONTRACT (machine-validated)",
-            role="leaf",
             correlation_id="initial",
             metadata={},
         )
@@ -305,9 +297,7 @@ class PluginTests(unittest.TestCase):
         self.assertEqual(payload["model"], "gpt-5.6-luna")
         request = ctx.subagent_lifecycle.requests[0]
         self.assertEqual(request.model, "gpt-5.6-luna")
-        self.assertEqual(request.role, "orchestrator")
         self.assertEqual(request.metadata["requested_model"], "gpt-5.6-luna")
-        self.assertEqual(request.metadata["requested_role"], "orchestrator")
         watcher.assert_called_once()
         self.assertEqual(watcher.call_args.kwargs["model"], "gpt-5.6-luna")
 
@@ -362,21 +352,18 @@ class PluginTests(unittest.TestCase):
 
         self.assertTrue(payload["success"])
         self.assertEqual(payload["subagent_id"], "sa-test-1234")
-        self.assertEqual(payload["requested_role"], "orchestrator")
-        self.assertEqual(payload["effective_role"], "orchestrator")
         self.assertEqual(payload["depth"], 1)
         request = ctx.subagent_lifecycle.requests[0]
-        self.assertEqual(request.role, "orchestrator")
         self.assertIsNone(request.model)
         self.assertEqual(request.allowed_toolsets, ("file",))
         self.assertIn("REVIEW RULES", request.context)
         self.assertEqual(request.metadata["display_name"], "Relay reviewer")
         self.assertEqual(request.metadata["requested_skills"], ["code-review"])
 
-    def test_launch_reports_hermes_role_downgrade_without_reimplementing_depth_logic(self):
+    def test_launch_reports_derived_effective_role_from_hermes_handle(self):
         ctx = FakeContext()
         ctx.subagent_lifecycle.launch = lambda request: SimpleNamespace(
-            subagent_id="sa-downgraded",
+            subagent_id="sa-derived",
             model=request.model or "inherited-model",
             role="leaf",
             depth=1,
@@ -389,10 +376,10 @@ class PluginTests(unittest.TestCase):
             payload = json.loads(handler({"name": "Reviewer", "goal": "Review"}))
 
         self.assertTrue(payload["success"])
-        self.assertEqual(payload["requested_role"], "orchestrator")
         self.assertEqual(payload["effective_role"], "leaf")
         self.assertEqual(payload["depth"], 1)
-        self.assertIn("Hermes configuration", payload["note"])
+        self.assertNotIn("requested_role", payload)
+        self.assertIn("from the spawn depth", payload["note"])
 
     def test_rejects_unknown_skill_before_launch(self):
         ctx = FakeContext()

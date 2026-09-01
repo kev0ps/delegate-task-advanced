@@ -99,16 +99,14 @@ def validate_text(value: Any, field: str, *, required: bool, max_chars: int) -> 
 
 
 TOOL_NAME = "delegate_task_advanced"
-DEFAULT_ROLE = "orchestrator"
-ROLES = frozenset({"leaf", "orchestrator"})
 ALLOWED_FIELDS = frozenset(
-    {"name", "goal", "context", "skills", "toolsets", "model", "role", "output_schema"}
+    {"name", "goal", "context", "skills", "toolsets", "model", "output_schema"}
 )
 
 SCHEMA = {
     "name": TOOL_NAME,
     "description": (
-        "Launch one named Hermes subagent in the background. Use it for a focused task that may require specific skills, toolsets, or a model override. Provide all necessary context, constraints, paths, and expected output, since the child starts with a fresh conversation. Hermes decides the subagent role and delegation depth. Omit toolsets and model to inherit the parent defaults. The call returns immediately and the result is delivered asynchronously. Prefer the native delegate_task by default; use this tool only when the display name, per-call skill injection, per-call toolset selection, same-provider model override, or per-call role and validated output_schema are actually needed for the mission."
+        "Launch one named Hermes subagent in the background. Use it for a focused task that may require specific skills, toolsets, or a model override. Provide all necessary context, constraints, paths, and expected output, since the child starts with a fresh conversation. Hermes decides the subagent role and delegation depth. Omit toolsets and model to inherit the parent defaults. The call returns immediately and the result is delivered asynchronously. Prefer the native delegate_task by default; use this tool only when the display name, per-call skill injection, per-call toolset selection, same-provider model override, or validated output_schema are actually needed for the mission."
     ),
     "parameters": {
         "type": "object",
@@ -170,19 +168,10 @@ SCHEMA = {
                     "Optional baseline selection of existing Hermes toolset names. Omit to "
                     "inherit the parent's normal capabilities. Every requested toolset must "
                     "already be available to the parent. These are toolset names, not "
-                    "individual tool names, and they do not imply read-only access. If Hermes "
-                    "grants the requested role, orchestrator adds delegation regardless of "
-                    "this list so the child can spawn within the globally configured depth. "
-                    "An explicit empty list is invalid."
-                ),
-            },
-            "role": {
-                "type": "string",
-                "enum": ["leaf", "orchestrator"],
-                "description": (
-                    "Optional role for this child. Defaults to orchestrator for backward "
-                    "compatibility. Hermes may downgrade orchestrator according to "
-                    "delegation.max_spawn_depth and delegation.orchestrator_enabled."
+                    "individual tool names, and they do not imply read-only access. Hermes "
+                    "may add delegation to the child's capabilities when the derived role "
+                    "permits it, so the child can spawn within the globally configured "
+                    "depth. An explicit empty list is invalid."
                 ),
             },
             "output_schema": {
@@ -213,14 +202,6 @@ def named_message(display_name: Optional[str], message: str) -> str:
 def wrap_goal(display_name: str, goal: str) -> str:
     """Build the display-prefixed goal once and reuse it everywhere."""
     return f"Subagent '{display_name}' — {goal}"
-
-
-def validate_role(value: Any) -> str:
-    if value is None:
-        return DEFAULT_ROLE
-    if not isinstance(value, str) or value.strip().lower() not in ROLES:
-        raise ValueError("role must be 'leaf' or 'orchestrator'.")
-    return value.strip().lower()
 
 
 def coerce_output_schema(value: Any) -> Optional[dict[str, Any]]:
@@ -310,6 +291,13 @@ def build_skill_context(
 
 
 # ---- Async lifecycle ----
+
+# Hermes v0.21.0 derives subagent capabilities from spawn depth, but the
+# internal dispatch/lifecycle signatures still require a role argument. This
+# constant satisfies that API without exposing role selection: the core
+# computes the effective role itself from delegation.max_spawn_depth and
+# delegation.orchestrator_enabled.
+_INTERNAL_ROLE = "leaf"
 
 
 def _value(obj: Any) -> str:
@@ -545,7 +533,6 @@ def dispatch_completion_watcher(
     context: Optional[str],
     toolsets: Optional[list[str]],
     model: Optional[str],
-    role: str,
     parent_session_id: Optional[str],
 ) -> dict[str, Any]:
     from tools.async_delegation import dispatch_async_delegation
@@ -556,7 +543,7 @@ def dispatch_completion_watcher(
         goal=wrapped_goal,
         context=context,
         toolsets=toolsets,
-        role=role,
+        role=_INTERNAL_ROLE,
         model=model,
         session_key=session_key,
         parent_session_id=parent_session_id,
@@ -631,7 +618,6 @@ def make_handler(ctx: Any):
                 params.get("context"), "context", required=False, max_chars=12000
             )
             model = validate_model(params.get("model"))
-            role = validate_role(params.get("role"))
             skills = normalize_name_list(params.get("skills"), "skills")
             if "toolsets" in params and params.get("toolsets") == []:
                 raise ValueError(
@@ -671,14 +657,12 @@ def make_handler(ctx: Any):
                 "requested_skills": loaded_skills,
                 "requested_toolsets": toolsets,
                 "requested_model": model,
-                "requested_role": role,
                 "parent_session_id": parent_session_id,
                 "correlation_id": correlation_id,
             }
             request = SubagentLaunchRequest(
                 goal=wrapped_goal,
                 context=enriched_context,
-                role=role,
                 model=model,
                 allowed_toolsets=tuple(toolsets) if toolsets else None,
                 parent_session_id=parent_session_id,
@@ -695,7 +679,6 @@ def make_handler(ctx: Any):
                 context=enriched_context,
                 toolsets=toolsets or None,
                 model=model,
-                role=role,
                 parent_session_id=parent_session_id,
             )
             if dispatch.get("status") != "dispatched":
@@ -711,17 +694,6 @@ def make_handler(ctx: Any):
                 state.set_launch_error(str(exc))
                 return error(named_message(display_name, str(exc)))
             state.set_handle(handle_obj)
-            effective_role = getattr(handle_obj, "role", None)
-            if role == "orchestrator" and effective_role != "orchestrator":
-                note = (
-                    "Hermes configuration downgraded the requested orchestrator to leaf. "
-                    "Check delegation.max_spawn_depth and delegation.orchestrator_enabled."
-                )
-            else:
-                note = (
-                    "The requested role was accepted. The result will re-enter this "
-                    "conversation through the normal background completion rail."
-                )
             return json.dumps(
                 {
                     "success": True,
@@ -730,14 +702,17 @@ def make_handler(ctx: Any):
                     "subagent_id": handle_obj.subagent_id,
                     "delegation_id": dispatch.get("delegation_id"),
                     "model": handle_obj.model,
-                    "requested_role": role,
-                    "effective_role": effective_role,
+                    "effective_role": getattr(handle_obj, "role", None),
                     "depth": getattr(handle_obj, "depth", None),
                     "toolsets": toolsets if toolsets else "inherited",
                     "skills": loaded_skills,
                     "correlation_id": correlation_id,
                     "live_transcript": dispatch.get("live_transcript"),
-                    "note": note,
+                    "note": (
+                        "Hermes derived the subagent capabilities from the spawn depth. "
+                        "The result will re-enter this conversation through the normal "
+                        "background completion rail."
+                    ),
                 },
                 ensure_ascii=False,
             )
