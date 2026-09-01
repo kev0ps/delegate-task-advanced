@@ -21,8 +21,8 @@ def register(ctx) -> None:
             "the parent defaults. The call returns immediately and the result is "
             "delivered asynchronously. Prefer the native delegate_task by default; "
             "use this tool only when the display name, per-call skill injection, "
-            "per-call toolset selection, same-provider model override, or per-call "
-            "role and validated output_schema are actually needed for the mission."
+            "per-call toolset selection, same-provider model override, or validated "
+            "output_schema are actually needed for the mission."
         ),
         emoji="🧭",
     )
