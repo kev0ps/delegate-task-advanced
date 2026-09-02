@@ -1,0 +1,10 @@
+name: delegate-task-advanced
+version: "1.1.1"
+description: "One named subagent with skills, toolsets, model selection, and validated output schemas."
+author: "Hermes Agent"
+provides_tools:
+  - delegate_task_advanced
+tags:
+  - delegation
+  - subagents
+  - security
