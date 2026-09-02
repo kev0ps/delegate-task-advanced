@@ -72,6 +72,22 @@ def test_schema_describes_selection_and_security_boundaries(registered_plugin):
     assert "delegation depth" in tool["description"]
 
 
+def test_sanitized_registered_schema_keeps_output_schema_open(registered_plugin):
+    from tools.schema_sanitizer import sanitize_tool_schemas
+
+    registered_schema = registered_plugin.tool["schema"]
+    sanitized = sanitize_tool_schemas(
+        [{"type": "function", "function": registered_schema}]
+    )
+
+    output_schema = sanitized[0]["function"]["parameters"]["properties"][
+        "output_schema"
+    ]
+
+    assert output_schema["type"] == "object"
+    assert output_schema["additionalProperties"] is True
+
+
 # ---- Public handler validation ---------------------------------------------
 
 

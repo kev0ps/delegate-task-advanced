@@ -22,12 +22,12 @@ from tools.delegation_output_schema import (
     coerce_output_schema,
     validate_output,
 )
+from tools.registry import tool_error, tool_result
 from toolsets import get_toolset
 
 TOOL_NAME = "delegate_task_advanced"
 TOOLSET = "delegation"
 EMOJI = "🧭"
-
 MAX_LIST_ITEMS = 8
 MAX_ITEM_CHARS = 128
 MAX_DISPLAY_NAME_CHARS = 80
@@ -36,12 +36,6 @@ MAX_USER_CONTEXT_CHARS = 12_000
 MAX_IDENTIFIER_CHARS = 128
 MAX_SKILL_CHARS = 20_000
 MAX_TOTAL_CONTEXT_CHARS = 32_000
-
-_ALLOWED_DISPLAY_PUNCTUATION = " -_.()"
-_ALLOWED_IDENTIFIER_PUNCTUATION = "-_/:."
-_START = f"<!-- BEGIN EXPLICIT SKILLS: {TOOL_NAME} -->"
-_END = f"<!-- END EXPLICIT SKILLS: {TOOL_NAME} -->"
-
 DESCRIPTION = (
     "Launch one named Hermes subagent in the background. Use it for a focused "
     "task that may require specific skills, toolsets, or a model override. "
@@ -54,7 +48,6 @@ DESCRIPTION = (
     "per-call toolset selection, same-provider model override, or validated "
     "output_schema are actually needed for the mission."
 )
-
 SCHEMA: dict[str, Any] = {
     "name": TOOL_NAME,
     "description": DESCRIPTION,
@@ -134,6 +127,7 @@ SCHEMA: dict[str, Any] = {
             },
             "output_schema": {
                 "type": "object",
+                "additionalProperties": True,
                 "description": (
                     "Optional JSON Schema for the child's final answer. The contract is "
                     "injected before launch and the final answer is validated. One bounded "
@@ -146,8 +140,11 @@ SCHEMA: dict[str, Any] = {
     },
 }
 
-ALLOWED_FIELDS = frozenset(SCHEMA["parameters"]["properties"])
 _LOGGER = logging.getLogger(__name__)
+_ALLOWED_DISPLAY_PUNCTUATION = " -_.()"
+_ALLOWED_IDENTIFIER_PUNCTUATION = "-_/:."
+_START = f"<!-- BEGIN EXPLICIT SKILLS: {TOOL_NAME} -->"
+_END = f"<!-- END EXPLICIT SKILLS: {TOOL_NAME} -->"
 
 
 # ---- Async lifecycle engine ----
@@ -521,16 +518,6 @@ class DelegateTaskAdvanced:
         self.lifecycle = ctx.subagent_lifecycle
 
     @staticmethod
-    def _error(message: str) -> str:
-        return json.dumps(
-            {
-                "success": False,
-                "error": message,
-            },
-            ensure_ascii=False,
-        )
-
-    @staticmethod
     def _named_message(
         display_name: str | None,
         message: str,
@@ -543,8 +530,7 @@ class DelegateTaskAdvanced:
         **kwargs: Any,
     ) -> str:
         if not isinstance(params, dict):
-            return self._error("Tool input must be an object.")
-
+            return tool_error("Tool input must be an object.", success=False)
         display_name: str | None = None
         state: _DeferredLaunch | None = None
 
@@ -590,18 +576,13 @@ class DelegateTaskAdvanced:
             if state is not None:
                 state.set_launch_error(str(exc))
 
-            return self._error(
-                self._named_message(
-                    display_name,
-                    str(exc),
-                )
-            )
+            return tool_error(self._named_message(display_name, str(exc)), success=False)
 
     @staticmethod
     def _validate_envelope(
         params: dict[str, Any],
     ) -> str:
-        unknown = sorted(set(params) - ALLOWED_FIELDS)
+        unknown = sorted(set(params) - set(SCHEMA["parameters"]["properties"]))
 
         if unknown:
             raise ValueError(f"Unknown fields: {', '.join(unknown)}.")
@@ -905,30 +886,24 @@ class DelegateTaskAdvanced:
             parent,
         )
 
+        parent_session_id = str(getattr(parent, "session_id", "") or "") or None
+
         return self._LaunchSpec(
-            display_name,
-            goal,
-            context,
-            model,
-            skills,
-            toolsets,
-            output_schema,
-            str(
-                getattr(
-                    parent,
-                    "session_id",
-                    "",
-                )
-                or ""
-            )
-            or None,
+            display_name=display_name,
+            goal=goal,
+            context=context,
+            model=model,
+            skills=skills,
+            toolsets=toolsets,
+            output_schema=output_schema,
+            parent_session_id=parent_session_id,
         )
 
     def _prepare(
         self,
         spec: "DelegateTaskAdvanced._LaunchSpec",
         kwargs: dict[str, Any],
-    ) -> Any:
+    ) -> SubagentLaunchRequest:
         dispatch_kwargs = {
             key: kwargs[key]
             for key in (
@@ -980,7 +955,7 @@ class DelegateTaskAdvanced:
     def _reserve(
         self,
         spec: "DelegateTaskAdvanced._LaunchSpec",
-        request: Any,
+        request: SubagentLaunchRequest,
         state: _DeferredLaunch,
     ) -> dict[str, Any]:
         session_key = get_current_session_key("")
@@ -1035,7 +1010,7 @@ class DelegateTaskAdvanced:
     def _launch(
         self,
         spec: "DelegateTaskAdvanced._LaunchSpec",
-        request: Any,
+        request: SubagentLaunchRequest,
         state: _DeferredLaunch,
         dispatch: dict[str, Any],
     ) -> str:
@@ -1059,10 +1034,7 @@ class DelegateTaskAdvanced:
                 note=("Cancellation won before the lifecycle child was launched."),
             )
 
-            return json.dumps(
-                payload,
-                ensure_ascii=False,
-            )
+            return tool_result(payload)
 
         handle = self.lifecycle.launch(request)
 
