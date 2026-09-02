@@ -269,11 +269,13 @@ class PluginTests(unittest.TestCase):
 
         result = state.run()
 
-        self.assertEqual(result["status"], "completed")
+        self.assertEqual(result["status"], "error")
         self.assertFalse(result["schema_valid"])
         self.assertTrue(result["schema_errors"])
         self.assertEqual(result["schema_retries"], 1)
         self.assertIn("retry launch failed", result["schema_retry_error"])
+        self.assertEqual(result["exit_reason"], "output_schema_invalid")
+        self.assertIn("output_schema validation failed", result["error"])
 
     def test_optional_model_is_passed_to_native_lifecycle(self):
         ctx = FakeContext()
