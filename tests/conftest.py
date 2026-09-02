@@ -10,7 +10,6 @@ from types import SimpleNamespace
 
 import pytest
 
-
 ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -32,10 +31,9 @@ def _ensure_hermes_importable() -> None:
         candidates.append(Path(local_app_data) / "hermes" / "hermes-agent")
 
     for candidate in candidates:
-        if (
-            (candidate / "agent" / "subagent_lifecycle.py").is_file()
-            and (candidate / "tools" / "delegate_tool.py").is_file()
-        ):
+        if (candidate / "agent" / "subagent_lifecycle.py").is_file() and (
+            candidate / "tools" / "delegate_tool.py"
+        ).is_file():
             sys.path.insert(0, str(candidate))
             if _hermes_is_importable():
                 return
@@ -49,9 +47,9 @@ def _ensure_hermes_importable() -> None:
 
 _ensure_hermes_importable()
 
-from support import FakeContext, FakeLifecycle  # noqa: E402
-from tools.async_delegation import _reset_for_tests  # noqa: E402
-from tools.process_registry import process_registry  # noqa: E402
+from support import FakeContext
+from tools.async_delegation import _reset_for_tests
+from tools.process_registry import process_registry
 
 
 def _prime_pytest_root_package() -> None:
@@ -94,11 +92,6 @@ def plugin_module(plugin_package):
 
 
 @pytest.fixture
-def fake_lifecycle() -> FakeLifecycle:
-    return FakeLifecycle()
-
-
-@pytest.fixture
 def fake_context() -> FakeContext:
     return FakeContext()
 
@@ -113,6 +106,46 @@ def registered_plugin(plugin_package, plugin_module, fake_context):
         tool=fake_context.tools[0],
         handler=fake_context.tools[0]["handler"],
     )
+
+
+@pytest.fixture
+def stub_delegation(monkeypatch):
+    """Stub the external dispatch boundary while exercising the public handler."""
+
+    def install(module, *, response=None, before_return=None, exception=None):
+        calls = []
+        result = response or {
+            "status": "dispatched",
+            "delegation_id": "deleg-test",
+        }
+
+        def fake_dispatch(**kwargs):
+            calls.append(kwargs)
+            if before_return is not None:
+                before_return(kwargs)
+            if exception is not None:
+                raise exception
+            return dict(result)
+
+        # Keep the adapter in one place so implementation refactors only affect
+        # this fixture, while each test remains focused on observable behavior.
+        if hasattr(module, "dispatch_async_delegation"):
+            monkeypatch.setattr(module, "dispatch_async_delegation", fake_dispatch)
+        elif hasattr(module, "dispatch_completion_watcher"):
+            monkeypatch.setattr(module, "dispatch_completion_watcher", fake_dispatch)
+        else:
+            raise AssertionError("Plugin exposes no delegation dispatch boundary")
+
+        if hasattr(module, "create_live_transcripts"):
+            monkeypatch.setattr(
+                module,
+                "create_live_transcripts",
+                lambda *_args, **_kwargs: ("test-live", [], []),
+            )
+
+        return calls
+
+    return install
 
 
 def _drain_completion_queue() -> None:

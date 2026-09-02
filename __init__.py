@@ -1,3 +1,5 @@
+# The host loads this entry point from the required hyphenated plugin folder.
+# ruff: noqa: N999
 """Hermes plugin entry point."""
 
 from __future__ import annotations
