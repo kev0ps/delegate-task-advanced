@@ -92,7 +92,7 @@ Do not add `delegate_task_advanced` directly to `platform_toolsets.*`. Those key
 
 ## Compatibility
 
-Version `1.1.1` targets the public plugin API available in Hermes Agent `v0.21.0`, which ignores any per-call role and derives subagent capabilities from the spawn depth. Later Hermes versions may evolve the public subagent lifecycle.
+Version `1.2.0` targets the public plugin API available in Hermes Agent `v0.21.0`, which ignores any per-call role and derives subagent capabilities from the spawn depth. Later Hermes versions may evolve the public subagent lifecycle.
 
 ## License
 
