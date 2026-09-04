@@ -1,113 +1,56 @@
-"""Single-module implementation of the delegate-task-advanced Hermes plugin."""
+"""Application service and runtime for the delegate-task-advanced plugin."""
 
+import contextvars
 import json
+import logging
 import threading
 import time
 import unicodedata
 import uuid
-from typing import Any, Callable, Optional
+from collections.abc import Sequence
+from dataclasses import dataclass, replace
+from typing import Any
 
+from agent.subagent_lifecycle import SubagentLaunchRequest, get_active_subagent_parent
+from gateway.session_context import get_session_env
+from tools.approval import get_current_session_key
+from tools.async_delegation import dispatch_async_delegation
+from tools.delegation_live_log import create_live_transcripts, update_manifest_statuses
+from tools.delegation_output_schema import (
+    append_output_contract,
+    build_retry_message,
+    coerce_output_schema,
+    validate_output,
+)
+from tools.registry import tool_error, tool_result
+from toolsets import get_toolset
 
-# ---- Input validation ----
-
+TOOL_NAME = "delegate_task_advanced"
+TOOLSET = "delegation"
+EMOJI = "🧭"
 MAX_LIST_ITEMS = 8
 MAX_ITEM_CHARS = 128
 MAX_DISPLAY_NAME_CHARS = 80
-_ALLOWED_DISPLAY_PUNCTUATION = " -_.()"
-_ALLOWED_IDENTIFIER_PUNCTUATION = "-_/:."
-
-
-def validate_display_name(value: Any) -> str:
-    if not isinstance(value, str):
-        raise ValueError("name must be a string.")
-    if any(unicodedata.category(char).startswith("C") for char in value):
-        raise ValueError("name must not contain control characters.")
-    name = " ".join(value.strip().split())
-    if not name or len(name) > MAX_DISPLAY_NAME_CHARS:
-        raise ValueError("name must contain 1 to 80 characters.")
-    for char in name:
-        if not (char.isalnum() or char in _ALLOWED_DISPLAY_PUNCTUATION):
-            raise ValueError(
-                "name may contain letters, numbers, spaces, hyphens, underscores, dots, and parentheses only."
-            )
-    return name
-
-
-def normalize_name_list(value: Any, field: str) -> list[str]:
-    if value is None:
-        return []
-    if not isinstance(value, list):
-        raise ValueError(f"{field} must be a list of names.")
-    if len(value) > MAX_LIST_ITEMS:
-        raise ValueError(f"{field} accepts at most {MAX_LIST_ITEMS} entries.")
-    normalized: list[str] = []
-    seen: set[str] = set()
-    for item in value:
-        if not isinstance(item, str):
-            raise ValueError(f"{field} entries must be strings.")
-        name = item.strip()
-        if not name or len(name) > MAX_ITEM_CHARS:
-            raise ValueError(
-                f"{field} entries must contain 1 to {MAX_ITEM_CHARS} characters."
-            )
-        if name.startswith(("/", ".")) or ".." in name:
-            raise ValueError(f"Invalid {field} entry: {name!r}.")
-        if any(
-            not (char.isalnum() or char in _ALLOWED_IDENTIFIER_PUNCTUATION)
-            for char in name
-        ):
-            raise ValueError(f"Invalid {field} entry: {name!r}.")
-        if name not in seen:
-            normalized.append(name)
-            seen.add(name)
-    return normalized
-
-
-def validate_identifier(value: Any, field: str) -> str | None:
-    """Validate one optional Hermes/provider identifier without interpreting it."""
-    if value is None:
-        return None
-    if not isinstance(value, str):
-        raise ValueError(f"{field} must be a string.")
-    identifier = value.strip()
-    if not identifier or len(identifier) > 128:
-        raise ValueError(f"{field} must contain 1 to 128 characters.")
-    if identifier.startswith(("/", ".")) or ".." in identifier:
-        raise ValueError(f"Invalid {field}: {identifier!r}.")
-    if any(
-        not (char.isalnum() or char in _ALLOWED_IDENTIFIER_PUNCTUATION)
-        for char in identifier
-    ):
-        raise ValueError(f"Invalid {field}: {identifier!r}.")
-    return identifier
-
-
-def validate_text(value: Any, field: str, *, required: bool, max_chars: int) -> str | None:
-    if value is None and not required:
-        return None
-    if not isinstance(value, str):
-        raise ValueError(f"{field} must be a string.")
-    text = value.strip()
-    if required and not text:
-        raise ValueError(f"{field} must not be empty.")
-    if len(text) > max_chars:
-        raise ValueError(f"{field} exceeds the {max_chars}-character limit.")
-    return text
-
-
-# ---- Tool contract (schema + validation entry points) ----
-
-
-TOOL_NAME = "delegate_task_advanced"
-ALLOWED_FIELDS = frozenset(
-    {"name", "goal", "context", "skills", "toolsets", "model", "output_schema"}
+MAX_GOAL_CHARS = 16_000
+MAX_USER_CONTEXT_CHARS = 12_000
+MAX_IDENTIFIER_CHARS = 128
+MAX_SKILL_CHARS = 20_000
+MAX_TOTAL_CONTEXT_CHARS = 32_000
+DESCRIPTION = (
+    "Launch one named Hermes subagent in the background. Use it for a focused "
+    "task that may require specific skills, toolsets, or a model override. "
+    "Provide all necessary context, constraints, paths, and expected output, "
+    "since the child starts with a fresh conversation. Hermes decides the "
+    "subagent role and delegation depth. Omit toolsets and model to inherit "
+    "the parent defaults. The call returns immediately and the result is "
+    "delivered asynchronously. Prefer the native delegate_task by default; "
+    "use this tool only when the display name, per-call skill injection, "
+    "per-call toolset selection, same-provider model override, or validated "
+    "output_schema are actually needed for the mission."
 )
-
-SCHEMA = {
+SCHEMA: dict[str, Any] = {
     "name": TOOL_NAME,
-    "description": (
-        "Launch one named Hermes subagent in the background. Use it for a focused task that may require specific skills, toolsets, or a model override. Provide all necessary context, constraints, paths, and expected output, since the child starts with a fresh conversation. Hermes decides the subagent role and delegation depth. Omit toolsets and model to inherit the parent defaults. The call returns immediately and the result is delivered asynchronously. Prefer the native delegate_task by default; use this tool only when the display name, per-call skill injection, per-call toolset selection, same-provider model override, or validated output_schema are actually needed for the mission."
-    ),
+    "description": DESCRIPTION,
     "parameters": {
         "type": "object",
         "additionalProperties": False,
@@ -115,7 +58,7 @@ SCHEMA = {
             "name": {
                 "type": "string",
                 "minLength": 1,
-                "maxLength": 80,
+                "maxLength": MAX_DISPLAY_NAME_CHARS,
                 "description": (
                     "Required human-readable display label. It appears in logs, status, "
                     "and completion messages; it is not the generated subagent_id or a "
@@ -125,7 +68,7 @@ SCHEMA = {
             "goal": {
                 "type": "string",
                 "minLength": 1,
-                "maxLength": 16000,
+                "maxLength": MAX_GOAL_CHARS,
                 "description": (
                     "Required self-contained objective. Include the expected deliverable "
                     "and acceptance criteria because the child cannot see the parent conversation."
@@ -133,7 +76,7 @@ SCHEMA = {
             },
             "context": {
                 "type": "string",
-                "maxLength": 12000,
+                "maxLength": MAX_USER_CONTEXT_CHARS,
                 "description": (
                     "Optional mission background: paths, relevant facts, constraints, "
                     "expected output format, language, and tone not already stated in goal."
@@ -142,7 +85,7 @@ SCHEMA = {
             "model": {
                 "type": "string",
                 "minLength": 1,
-                "maxLength": 128,
+                "maxLength": MAX_IDENTIFIER_CHARS,
                 "description": (
                     "Optional model identifier. Omit to inherit the parent model. A supplied "
                     "value overrides only the model within the parent's provider; it cannot "
@@ -151,8 +94,12 @@ SCHEMA = {
             },
             "skills": {
                 "type": "array",
-                "maxItems": 8,
-                "items": {"type": "string", "minLength": 1, "maxLength": 128},
+                "maxItems": MAX_LIST_ITEMS,
+                "items": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": MAX_ITEM_CHARS,
+                },
                 "description": (
                     "Optional skill names loaded through skill_view and injected into the "
                     "child context before launch. Skills grant no permissions. Missing or "
@@ -162,8 +109,12 @@ SCHEMA = {
             "toolsets": {
                 "type": "array",
                 "minItems": 1,
-                "maxItems": 8,
-                "items": {"type": "string", "minLength": 1, "maxLength": 128},
+                "maxItems": MAX_LIST_ITEMS,
+                "items": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": MAX_ITEM_CHARS,
+                },
                 "description": (
                     "Optional baseline selection of existing Hermes toolset names. Omit to "
                     "inherit the parent's normal capabilities. Every requested toolset must "
@@ -176,6 +127,7 @@ SCHEMA = {
             },
             "output_schema": {
                 "type": "object",
+                "additionalProperties": True,
                 "description": (
                     "Optional JSON Schema for the child's final answer. The contract is "
                     "injected before launch and the final answer is validated. One bounded "
@@ -188,238 +140,187 @@ SCHEMA = {
     },
 }
 
-
-def error(message: str) -> str:
-    return json.dumps({"success": False, "error": message}, ensure_ascii=False)
-
-
-def named_message(display_name: Optional[str], message: str) -> str:
-    if display_name:
-        return f"Subagent '{display_name}': {message}"
-    return message
+_LOGGER = logging.getLogger(__name__)
+_ALLOWED_DISPLAY_PUNCTUATION = " -_.()"
+_ALLOWED_IDENTIFIER_PUNCTUATION = "-_/:."
+_START = f"<!-- BEGIN EXPLICIT SKILLS: {TOOL_NAME} -->"
+_END = f"<!-- END EXPLICIT SKILLS: {TOOL_NAME} -->"
 
 
-def wrap_goal(display_name: str, goal: str) -> str:
-    """Build the display-prefixed goal once and reuse it everywhere."""
-    return f"Subagent '{display_name}' — {goal}"
+# ---- Async lifecycle engine ----
 
 
-def coerce_output_schema(value: Any) -> Optional[dict[str, Any]]:
-    from tools.delegation_output_schema import coerce_output_schema as native_coerce
-
-    schema, schema_error = native_coerce(value)
-    if schema_error:
-        raise ValueError(f"output_schema invalid: {schema_error}")
-    return schema
-
-
-def validate_model(value: Any) -> Optional[str]:
-    return validate_identifier(value, "model")
-
-
-# ---- Skill injection ----
-
-DEFAULT_MAX_SKILL_CHARS = 20_000
-_CONTEXT_LIMIT = 32_000
-_START = "<!-- BEGIN EXPLICIT SKILLS: delegate_task_advanced -->"
-_END = "<!-- END EXPLICIT SKILLS: delegate_task_advanced -->"
-
-
-def build_skill_context(
-    base_context: Optional[str],
-    skill_names: list[str],
-    dispatch_tool: Callable[..., str],
-    *,
-    max_chars: int = DEFAULT_MAX_SKILL_CHARS,
-    dispatch_kwargs: Optional[dict] = None,
-) -> tuple[Optional[str], list[str]]:
-    if not skill_names:
-        return base_context, []
-
-    blocks: list[str] = []
-    total = 0
-    kwargs = dispatch_kwargs or {}
-    for name in skill_names:
-        raw = dispatch_tool("skill_view", {"name": name}, **kwargs)
-        try:
-            payload = json.loads(raw) if isinstance(raw, str) else raw
-        except (TypeError, json.JSONDecodeError) as exc:
-            raise ValueError(f"Skill {name!r} returned a malformed response.") from exc
-        if not isinstance(payload, dict):
-            raise ValueError(f"Skill {name!r} returned a malformed response.")
-
-        # skill_view deduplicates repeat reads per parent task. That stub is
-        # useful for the model, but this plugin needs the full text to inject
-        # into a new child context. Retry once without the parent's task_id;
-        # keep session_id so usage attribution remains intact.
-        if (
-            payload.get("success") is True
-            and payload.get("dedup") is True
-            and payload.get("content_returned") is False
-            and "task_id" in kwargs
-        ):
-            retry_kwargs = {key: value for key, value in kwargs.items() if key != "task_id"}
-            raw = dispatch_tool("skill_view", {"name": name}, **retry_kwargs)
-            try:
-                payload = json.loads(raw) if isinstance(raw, str) else raw
-            except (TypeError, json.JSONDecodeError) as exc:
-                raise ValueError(f"Skill {name!r} returned a malformed response.") from exc
-            if not isinstance(payload, dict):
-                raise ValueError(f"Skill {name!r} returned a malformed response.")
-
-        if payload.get("success") is not True:
-            detail = str(payload.get("error") or "skill_view failed")
-            raise ValueError(f"Could not load skill {name!r}: {detail}")
-        content = payload.get("content")
-        if not isinstance(content, str) or not content.strip():
-            raise ValueError(f"Skill {name!r} returned no content.")
-        block = f"### Skill: {name}\n\n{content.strip()}"
-        total += len(block)
-        if total > max_chars:
-            raise ValueError(
-                f"Requested skills exceed the {max_chars}-character injection limit."
-            )
-        blocks.append(block)
-
-    framed = f"{_START}\n" + "\n\n".join(blocks) + f"\n{_END}"
-    combined = f"{base_context}\n\n{framed}" if base_context else framed
-    if len(combined) > _CONTEXT_LIMIT:
-        raise ValueError(
-            f"Mission context plus skills exceeds Hermes' {_CONTEXT_LIMIT}-character lifecycle limit."
-        )
-    return combined, list(skill_names)
-
-
-# ---- Async lifecycle ----
-
-# Hermes v0.21.0 derives subagent capabilities from spawn depth, but the
-# internal dispatch/lifecycle signatures still require a role argument. This
-# constant satisfies that API without exposing role selection: the core
-# computes the effective role itself from delegation.max_spawn_depth and
-# delegation.orchestrator_enabled.
-_INTERNAL_ROLE = "leaf"
-
-
-def _value(obj: Any) -> str:
-    return str(getattr(obj, "value", obj) or "")
-
-
-def result_payload(
-    lifecycle: Any,
-    handle: Any,
-    display_name: str,
-    output_schema: Optional[dict[str, Any]] = None,
-) -> dict[str, Any]:
-    lifecycle.wait(handle, timeout_seconds=None)
-    result = lifecycle.result(handle)
-    terminal = _value(result.terminal_state).upper()
-    status = (
-        "completed"
-        if terminal == "SUCCEEDED"
-        else "interrupted"
-        if terminal in {"INTERRUPTED", "CANCELLED"}
-        else "error"
-    )
-    summary = result.summary
-    if summary:
-        summary = f"Subagent '{display_name}'\n\n{summary}"
-    else:
-        summary = f"Subagent '{display_name}' finished without a usable result."
-    result_error = result.error_message
-    if result_error:
-        result_error = named_message(display_name, str(result_error))
-    usage = result.usage_metadata if isinstance(result.usage_metadata, dict) else {}
-    execution = (
-        result.tool_execution_summary
-        if isinstance(result.tool_execution_summary, dict)
-        else {}
-    )
-    payload = {
-        "status": status,
-        "summary": summary,
-        "error": result_error,
-        "api_calls": usage.get("api_calls", 0),
-        "duration_seconds": execution.get("duration_seconds"),
-        "model": getattr(handle, "model", None),
-        "effective_role": getattr(handle, "role", None),
-        "depth": getattr(handle, "depth", None),
-        "exit_reason": terminal.lower(),
-    }
-    if output_schema is not None:
-        from tools.delegation_output_schema import validate_output
-
-        schema_valid, schema_errors = validate_output(
-            str(result.summary or ""), output_schema
-        )
-        payload["schema_valid"] = schema_valid
-        if not schema_valid:
-            payload["schema_errors"] = schema_errors
-    return payload
-
-
-class DeferredLaunch:
+class _DeferredLaunch:
     """Reserve completion routing before launch, eliminating orphaned children."""
 
     def __init__(
         self,
         lifecycle: Any,
         display_name: str,
-        output_schema: Optional[dict[str, Any]] = None,
+        output_schema: dict[str, Any] | None = None,
     ):
-        self.lifecycle = lifecycle
-        self.display_name = display_name
-        self.output_schema = output_schema
-        self.retry_request: Any = None
-        self.handle: Any = None
-        self.launch_error: Optional[str] = None
-        self.cancel_requested = False
-        self.writer: Any = None
-        self.live_delegation_id: Optional[str] = None
-        self._event = threading.Event()
-        self._lock = threading.Lock()
+        self.lifecycle, self.display_name, self.output_schema = (
+            lifecycle,
+            display_name,
+            output_schema,
+        )
+        self.retry_request = self.handle = None
+        self.launch_error: str | None = None
+        self.cancel_requested = self.cancelled_before_launch = False
+        self.writer = None
+        self.live_delegation_id: str | None = None
+        self._cancel_context = contextvars.copy_context()
+        self._event, self._lock = threading.Event(), threading.Lock()
+
+    def _named_message(self, message: str) -> str:
+        return f"Subagent '{self.display_name}': {message}"
+
+    def begin_launch(self) -> bool:
+        with self._lock:
+            if not self.cancel_requested:
+                return True
+
+            self.cancelled_before_launch = True
+            self._event.set()
+            return False
+
+    def _cancel_handle(self, handle: Any) -> None:
+        self._cancel_context.copy().run(
+            self.lifecycle.cancel,
+            handle,
+            reason=self._named_message("cancellation requested"),
+        )
 
     def set_handle(self, handle: Any) -> None:
         with self._lock:
-            self.handle = handle
-            cancel_now = self.cancel_requested
-        if cancel_now:
-            try:
-                self.lifecycle.cancel(
-                    handle, reason=named_message(self.display_name, "cancellation requested")
-                )
-            finally:
-                self._event.set()
-        else:
+            self.handle, cancel_now = handle, self.cancel_requested
+
+        try:
+            if cancel_now:
+                self._cancel_handle(handle)
+        finally:
             self._event.set()
 
     def set_launch_error(self, message: str) -> None:
         with self._lock:
-            self.launch_error = message
-            self._event.set()
+            if self.handle is None and self.launch_error is None:
+                self.launch_error = message
+                self._event.set()
 
     def cancel(self) -> None:
         with self._lock:
             self.cancel_requested = True
             handle = self.handle
+
         if handle is not None:
-            self.lifecycle.cancel(
-                handle, reason=named_message(self.display_name, "cancellation requested")
+            self._cancel_handle(handle)
+
+    def _result_payload(self, handle: Any) -> dict[str, Any]:
+        self.lifecycle.wait(handle, timeout_seconds=None)
+        result = self.lifecycle.result(handle)
+
+        terminal_state = result.terminal_state
+        terminal = str(getattr(terminal_state, "value", terminal_state) or "").upper()
+
+        status = (
+            "completed"
+            if terminal == "SUCCEEDED"
+            else "interrupted"
+            if terminal in {"INTERRUPTED", "CANCELLED"}
+            else "error"
+        )
+
+        usage = result.usage_metadata if isinstance(result.usage_metadata, dict) else {}
+        execution = (
+            result.tool_execution_summary
+            if isinstance(result.tool_execution_summary, dict)
+            else {}
+        )
+
+        payload = {
+            "status": status,
+            "summary": (
+                f"Subagent '{self.display_name}'\n\n{result.summary}"
+                if result.summary
+                else f"Subagent '{self.display_name}' finished without a usable result."
+            ),
+            "error": (
+                self._named_message(str(result.error_message))
+                if result.error_message
+                else None
+            ),
+            "api_calls": usage.get("api_calls", 0),
+            "duration_seconds": execution.get("duration_seconds"),
+            "model": getattr(handle, "model", None),
+            "effective_role": getattr(handle, "role", None),
+            "depth": getattr(handle, "depth", None),
+            "exit_reason": terminal.lower(),
+        }
+
+        if self.output_schema is not None:
+            schema_valid, schema_errors = validate_output(
+                str(result.summary or ""),
+                self.output_schema,
             )
 
-    def _retry_invalid_output(self, first: dict[str, Any]) -> dict[str, Any]:
-        from dataclasses import replace
-        from tools.delegation_output_schema import build_retry_message
+            payload.update(
+                schema_valid=schema_valid,
+                schema_retries=0,
+            )
+
+            if not schema_valid:
+                payload["schema_errors"] = schema_errors
+
+        return payload
+
+    def _failure(
+        self,
+        status: str,
+        summary: str,
+        error_message: str,
+        exit_reason: str,
+        started: float,
+        model: Any = None,
+    ) -> dict[str, Any]:
+        return {
+            "status": status,
+            "summary": self._named_message(summary),
+            "error": self._named_message(error_message),
+            "api_calls": 0,
+            "duration_seconds": round(time.monotonic() - started, 2),
+            "model": model,
+            "exit_reason": exit_reason,
+        }
+
+    def _retry_invalid_output(
+        self,
+        first: dict[str, Any],
+    ) -> dict[str, Any]:
+        with self._lock:
+            if self.cancel_requested:
+                return {
+                    **first,
+                    "status": "interrupted",
+                    "exit_reason": "cancelled",
+                    "schema_retries": 0,
+                    "schema_retry_error": ("Correction retry cancelled before launch."),
+                }
 
         errors = list(first.get("schema_errors") or [])
-        correction = build_retry_message(errors)
         prior = str(first.get("summary") or "")
+
         if prior.startswith(f"Subagent '{self.display_name}'"):
             prior = prior.split("\n\n", 1)[-1]
+
         retry_context = (
             f"{str(self.retry_request.context or '')[:24000]}\n\n"
             "CORRECTION RETRY (fresh lifecycle child):\n"
-            f"Previous response:\n{prior[:4000]}\n\n{correction[:3000]}"
+            f"Previous response:\n{prior[:4000]}\n\n"
+            f"{build_retry_message(errors)[:3000]}"
         )
+
+        correlation_id = f"dta-retry-{uuid.uuid4().hex}"
+
         retry_request = replace(
             self.retry_request,
             goal=(
@@ -427,298 +328,767 @@ class DeferredLaunch:
                 f"'{self.display_name}' so it satisfies the output contract."
             ),
             context=retry_context,
-            correlation_id=f"dta-retry-{uuid.uuid4().hex}",
-            metadata={**dict(self.retry_request.metadata), "schema_retry": 1},
+            correlation_id=correlation_id,
+            metadata={
+                **dict(self.retry_request.metadata),
+                "correlation_id": correlation_id,
+                "schema_retry": 1,
+            },
         )
+
         try:
             retry_handle = self.lifecycle.launch(retry_request)
-            retried = result_payload(
-                self.lifecycle,
-                retry_handle,
-                self.display_name,
-                self.output_schema,
-            )
+            self.set_handle(retry_handle)
+
+            retried = self._result_payload(retry_handle)
             retried["schema_retries"] = 1
+
             retried["api_calls"] = int(first.get("api_calls", 0) or 0) + int(
                 retried.get("api_calls", 0) or 0
             )
+
             retried["duration_seconds"] = round(
                 float(first.get("duration_seconds", 0) or 0)
                 + float(retried.get("duration_seconds", 0) or 0),
                 2,
             )
+
             return retried
-        except Exception as retry_exc:
-            first["schema_retries"] = 1
-            first["schema_retry_error"] = str(retry_exc)
+
+        # A correction retry is an optional recovery path. Any provider or
+        # lifecycle failure is reported in the original result instead of
+        # masking the first validation failure.
+        except Exception as exc:  # noqa: BLE001
+            first.update(
+                schema_retries=1,
+                schema_retry_error=str(exc),
+            )
             return first
+
+    def _finalize_result(
+        self,
+        result: dict[str, Any],
+    ) -> None:
+        if result.get("status") == "completed" and result.get("schema_valid") is False:
+            details = list(result.get("schema_errors") or [])
+
+            if result.get("schema_retry_error"):
+                details.append(str(result["schema_retry_error"]))
+
+            detail = "; ".join(str(item) for item in details[:3])
+
+            result.update(
+                status="error",
+                error=self._named_message(
+                    "output_schema validation failed after the bounded correction retry"
+                    + (f": {detail}" if detail else ".")
+                ),
+                exit_reason="output_schema_invalid",
+            )
+
+        metadata = {
+            key: result[key]
+            for key in (
+                "effective_role",
+                "depth",
+                "schema_valid",
+                "schema_retries",
+                "schema_errors",
+            )
+            if key in result
+        }
+
+        if metadata and result.get("summary"):
+            result["summary"] += "\n\ndelegate_task_advanced metadata: " + json.dumps(
+                metadata, ensure_ascii=False
+            )
+
+    def _publish_result(
+        self,
+        result: dict[str, Any],
+    ) -> None:
+        if self.writer is not None:
+            try:
+                self.writer.finalize(result)
+            # Result delivery must remain best effort once the lifecycle has
+            # completed; a transcript sink must not replace the real result.
+            except Exception as exc:  # noqa: BLE001
+                _LOGGER.debug("Could not finalize the live transcript: %s", exc)
+
+        if self.live_delegation_id:
+            try:
+                update_manifest_statuses(
+                    self.live_delegation_id,
+                    [{"task_index": 0, **result}],
+                )
+            # The manifest is observability data and must not affect the
+            # completion payload when its backend is unavailable.
+            except Exception as exc:  # noqa: BLE001
+                _LOGGER.debug("Could not update the delegation manifest: %s", exc)
+
+    def _resolve_result(
+        self,
+        started: float,
+    ) -> dict[str, Any]:
+        if self.cancelled_before_launch:
+            return self._failure(
+                "interrupted",
+                "cancelled before lifecycle launch.",
+                "cancellation requested",
+                "cancelled_before_launch",
+                started,
+            )
+
+        if self.launch_error is not None:
+            return self._failure(
+                "error",
+                "launch failed.",
+                self.launch_error,
+                "launch_error",
+                started,
+            )
+
+        try:
+            result = self._result_payload(self.handle)
+
+            if (
+                self.output_schema is not None
+                and result.get("status") == "completed"
+                and result.get("schema_valid") is False
+                and self.retry_request is not None
+            ):
+                return self._retry_invalid_output(result)
+
+            return result
+
+        # The lifecycle is an external runtime boundary. Convert provider
+        # failures into the stable error payload exposed by this tool.
+        except Exception as exc:  # noqa: BLE001
+            return self._failure(
+                "error",
+                "lifecycle monitoring failed.",
+                str(exc),
+                "lifecycle_error",
+                started,
+                getattr(self.handle, "model", None),
+            )
 
     def run(self) -> dict[str, Any]:
         started = time.monotonic()
-        self._event.wait()
-        if self.launch_error is not None:
-            result = {
-                "status": "error",
-                "summary": named_message(self.display_name, "launch failed."),
-                "error": named_message(self.display_name, self.launch_error),
-                "api_calls": 0,
-                "duration_seconds": round(time.monotonic() - started, 2),
-                "model": None,
-                "exit_reason": "launch_error",
-            }
-        else:
-            try:
-                result = result_payload(
-                    self.lifecycle,
-                    self.handle,
-                    self.display_name,
-                    self.output_schema,
-                )
-                if (
-                    self.output_schema is not None
-                    and result.get("status") == "completed"
-                    and result.get("schema_valid") is False
-                    and self.retry_request is not None
-                ):
-                    result = self._retry_invalid_output(result)
-            except Exception as exc:
-                result = {
-                    "status": "error",
-                    "summary": named_message(
-                        self.display_name, "lifecycle monitoring failed."
-                    ),
-                    "error": named_message(self.display_name, str(exc)),
-                    "api_calls": 0,
-                    "duration_seconds": round(time.monotonic() - started, 2),
-                    "model": getattr(self.handle, "model", None),
-                    "exit_reason": "lifecycle_error",
-                }
-        if self.writer is not None:
-            self.writer.finalize(result)
-        if self.live_delegation_id:
-            try:
-                from tools.delegation_live_log import update_manifest_statuses
 
-                update_manifest_statuses(
-                    self.live_delegation_id, [{"task_index": 0, **result}]
-                )
-            except Exception:
-                pass
+        self._event.wait()
+
+        result = self._resolve_result(started)
+
+        self._finalize_result(result)
+        self._publish_result(result)
+
         return result
 
 
-def routing_context() -> tuple[str, str, str]:
-    session_key = ""
-    origin_ui_session_id = ""
-    origin_session_id = ""
-    try:
-        from tools.approval import get_current_session_key
-
-        session_key = get_current_session_key() or ""
-    except Exception:
-        pass
-    try:
-        from gateway.session_context import get_session_env
-
-        origin_ui_session_id = get_session_env("HERMES_UI_SESSION_ID", "") or ""
-    except Exception:
-        pass
-    return session_key, origin_ui_session_id, origin_session_id
+# ---- Model-facing application service ----
 
 
-def dispatch_completion_watcher(
-    *,
-    state: DeferredLaunch,
-    wrapped_goal: str,
-    context: Optional[str],
-    toolsets: Optional[list[str]],
-    model: Optional[str],
-    parent_session_id: Optional[str],
-) -> dict[str, Any]:
-    from tools.async_delegation import dispatch_async_delegation
-    from tools.delegation_live_log import create_live_transcripts
+class DelegateTaskAdvanced:
+    """Application service and public definition of the advanced delegation tool."""
 
-    session_key, origin_ui_session_id, origin_session_id = routing_context()
-    result = dispatch_async_delegation(
-        goal=wrapped_goal,
-        context=context,
-        toolsets=toolsets,
-        role=_INTERNAL_ROLE,
-        model=model,
-        session_key=session_key,
-        parent_session_id=parent_session_id,
-        runner=state.run,
-        origin_ui_session_id=origin_ui_session_id,
-        origin_session_id=origin_session_id,
-        interrupt_fn=state.cancel,
-    )
-    if result.get("status") == "dispatched":
-        live_id, writers, paths = create_live_transcripts(
-            [{"goal": wrapped_goal, "context": context}],
-            context,
-            delegation_id=result.get("delegation_id"),
-        )
-        state.live_delegation_id = live_id
-        state.writer = writers[0] if writers else None
-        if paths:
-            result["live_transcript"] = paths[0]
-    return result
+    name = TOOL_NAME
+    toolset = TOOLSET
+    schema = SCHEMA
+    description = DESCRIPTION
+    emoji = EMOJI
 
+    @dataclass(frozen=True, slots=True)
+    class _LaunchSpec:
+        display_name: str
+        goal: str
+        context: str | None
+        model: str | None
+        skills: tuple[str, ...]
+        toolsets: tuple[str, ...]
+        output_schema: dict[str, Any] | None
+        parent_session_id: str | None
 
-# ---- Model-facing handler ----
+        @property
+        def wrapped_goal(self) -> str:
+            return f"Subagent '{self.display_name}' — {self.goal}"
 
+    def __init__(self, ctx: Any):
+        self.ctx = ctx
+        self.lifecycle = ctx.subagent_lifecycle
 
-def active_parent(explicit_parent: Any) -> Any:
-    if explicit_parent is not None:
-        return explicit_parent
-    try:
-        from agent.subagent_lifecycle import get_active_subagent_parent
+    @staticmethod
+    def _named_message(
+        display_name: str | None,
+        message: str,
+    ) -> str:
+        return f"Subagent '{display_name}': {message}" if display_name else message
 
-        return get_active_subagent_parent()
-    except Exception:
-        return None
-
-
-def validate_toolsets(toolsets: list[str], parent_agent: Any) -> None:
-    if not toolsets:
-        return
-    from toolsets import get_toolset
-
-    unknown = [name for name in toolsets if get_toolset(name) is None]
-    if unknown:
-        raise ValueError(f"Unknown toolsets: {', '.join(sorted(unknown))}.")
-    enabled = getattr(parent_agent, "enabled_toolsets", None)
-    if enabled is not None and not set(toolsets).issubset(set(enabled)):
-        raise ValueError(
-            "Requested toolsets would broaden parent permissions. Enable the "
-            "narrow toolset for the parent platform before selecting it."
-        )
-
-
-def make_handler(ctx: Any):
-    def handle(params: dict, **kwargs: Any) -> str:
-        display_name: Optional[str] = None
-        state: Optional[DeferredLaunch] = None
+    def handle(
+        self,
+        params: dict,
+        **kwargs: Any,
+    ) -> str:
         if not isinstance(params, dict):
-            return error("Tool input must be an object.")
-        unknown = sorted(set(params) - ALLOWED_FIELDS)
-        if unknown:
-            return error(f"Unknown fields: {', '.join(unknown)}.")
+            return tool_error("Tool input must be an object.", success=False)
+        display_name: str | None = None
+        state: _DeferredLaunch | None = None
+
         try:
-            display_name = validate_display_name(params.get("name"))
-            goal = validate_text(
-                params.get("goal"), "goal", required=True, max_chars=16000
-            )
-            wrapped_goal = wrap_goal(display_name, goal)
-            if len(wrapped_goal) > 16000:
-                raise ValueError(
-                    "goal is too long once the required display-name prefix is applied."
-                )
-            context = validate_text(
-                params.get("context"), "context", required=False, max_chars=12000
-            )
-            model = validate_model(params.get("model"))
-            skills = normalize_name_list(params.get("skills"), "skills")
-            if "toolsets" in params and params.get("toolsets") == []:
-                raise ValueError(
-                    "toolsets cannot be an explicit empty list; omit it to inherit Hermes capabilities."
-                )
-            toolsets = normalize_name_list(params.get("toolsets"), "toolsets")
-            output_schema = coerce_output_schema(params.get("output_schema"))
-            parent_agent = active_parent(kwargs.get("parent_agent"))
-            validate_toolsets(toolsets, parent_agent)
-            dispatch_kwargs = {
-                key: kwargs[key]
-                for key in ("task_id", "session_id")
-                if kwargs.get(key) is not None
-            }
-            enriched_context, loaded_skills = build_skill_context(
-                context,
-                skills,
-                ctx.dispatch_tool,
-                dispatch_kwargs=dispatch_kwargs,
-            )
-            if output_schema is not None:
-                from tools.delegation_output_schema import append_output_contract
+            display_name = self._validate_envelope(params)
 
-                enriched_context = append_output_contract(
-                    enriched_context, output_schema
-                )
-
-            from agent.subagent_lifecycle import SubagentLaunchRequest
-
-            correlation_id = f"dta-{uuid.uuid4().hex}"
-            parent_session_id = (
-                str(getattr(parent_agent, "session_id", "") or "") or None
+            spec = self._build_spec(
+                params,
+                display_name,
+                kwargs.get("parent_agent"),
             )
-            metadata = {
-                "source_tool": TOOL_NAME,
-                "display_name": display_name,
-                "requested_skills": loaded_skills,
-                "requested_toolsets": toolsets,
-                "requested_model": model,
-                "parent_session_id": parent_session_id,
-                "correlation_id": correlation_id,
-            }
-            request = SubagentLaunchRequest(
-                goal=wrapped_goal,
-                context=enriched_context,
-                model=model,
-                allowed_toolsets=tuple(toolsets) if toolsets else None,
-                parent_session_id=parent_session_id,
-                correlation_id=correlation_id,
-                metadata=metadata,
+
+            request = self._prepare(
+                spec,
+                kwargs,
             )
-            lifecycle = ctx.subagent_lifecycle
-            state = DeferredLaunch(lifecycle, display_name, output_schema)
-            if output_schema is not None:
+
+            state = _DeferredLaunch(
+                self.lifecycle,
+                spec.display_name,
+                spec.output_schema,
+            )
+
+            if spec.output_schema is not None:
                 state.retry_request = request
-            dispatch = dispatch_completion_watcher(
-                state=state,
-                wrapped_goal=wrapped_goal,
-                context=enriched_context,
-                toolsets=toolsets or None,
-                model=model,
-                parent_session_id=parent_session_id,
+
+            dispatch = self._reserve(
+                spec,
+                request,
+                state,
             )
-            if dispatch.get("status") != "dispatched":
-                message = str(
-                    dispatch.get("error") or "Completion delivery rejected."
+
+            return self._launch(
+                spec,
+                request,
+                state,
+                dispatch,
+            )
+
+        # Keep the public handler total: setup failures become a structured
+        # error response instead of escaping into the host tool runner.
+        except Exception as exc:  # noqa: BLE001
+            if state is not None:
+                state.set_launch_error(str(exc))
+
+            return tool_error(self._named_message(display_name, str(exc)), success=False)
+
+    @staticmethod
+    def _validate_envelope(
+        params: dict[str, Any],
+    ) -> str:
+        unknown = sorted(set(params) - set(SCHEMA["parameters"]["properties"]))
+
+        if unknown:
+            raise ValueError(f"Unknown fields: {', '.join(unknown)}.")
+
+        value = params.get("name")
+
+        if not isinstance(value, str):
+            raise TypeError("name must be a string.")
+
+        if any(unicodedata.category(char).startswith("C") for char in value):
+            raise ValueError("name must not contain control characters.")
+
+        name = " ".join(value.strip().split())
+
+        if not name or len(name) > MAX_DISPLAY_NAME_CHARS:
+            raise ValueError(
+                f"name must contain 1 to {MAX_DISPLAY_NAME_CHARS} characters."
+            )
+
+        if any(
+            not (char.isalnum() or char in _ALLOWED_DISPLAY_PUNCTUATION)
+            for char in name
+        ):
+            raise ValueError(
+                "name may contain letters, numbers, spaces, "
+                "hyphens, underscores, dots, and parentheses only."
+            )
+
+        return name
+
+    @staticmethod
+    def _normalize_name_list(
+        value: Any,
+        field: str,
+    ) -> list[str]:
+        if value is None:
+            return []
+
+        if not isinstance(value, list):
+            raise TypeError(f"{field} must be a list of names.")
+
+        if len(value) > MAX_LIST_ITEMS:
+            raise ValueError(f"{field} accepts at most {MAX_LIST_ITEMS} entries.")
+
+        normalized: list[str] = []
+        seen: set[str] = set()
+
+        for item in value:
+            if not isinstance(item, str):
+                raise TypeError(f"{field} entries must be strings.")
+
+            name = item.strip()
+
+            if not name or len(name) > MAX_ITEM_CHARS:
+                raise ValueError(
+                    f"{field} entries must contain 1 to {MAX_ITEM_CHARS} characters."
                 )
-                state.set_launch_error(message)
-                return error(named_message(display_name, message))
 
-            try:
-                handle_obj = lifecycle.launch(request)
-            except Exception as exc:
-                state.set_launch_error(str(exc))
-                return error(named_message(display_name, str(exc)))
-            state.set_handle(handle_obj)
-            return json.dumps(
-                {
-                    "success": True,
-                    "status": "launched",
-                    "name": display_name,
-                    "subagent_id": handle_obj.subagent_id,
-                    "delegation_id": dispatch.get("delegation_id"),
-                    "model": handle_obj.model,
-                    "effective_role": getattr(handle_obj, "role", None),
-                    "depth": getattr(handle_obj, "depth", None),
-                    "toolsets": toolsets if toolsets else "inherited",
-                    "skills": loaded_skills,
-                    "correlation_id": correlation_id,
-                    "live_transcript": dispatch.get("live_transcript"),
-                    "note": (
-                        "Hermes derived the subagent capabilities from the spawn depth. "
-                        "The result will re-enter this conversation through the normal "
-                        "background completion rail."
-                    ),
-                },
-                ensure_ascii=False,
+            if name.startswith(("/", ".")) or ".." in name:
+                raise ValueError(f"Invalid {field} entry: {name!r}.")
+
+            if any(
+                not (char.isalnum() or char in _ALLOWED_IDENTIFIER_PUNCTUATION)
+                for char in name
+            ):
+                raise ValueError(f"Invalid {field} entry: {name!r}.")
+
+            if name not in seen:
+                normalized.append(name)
+                seen.add(name)
+
+        return normalized
+
+    @staticmethod
+    def _validate_identifier(
+        value: Any,
+        field: str,
+    ) -> str | None:
+        if value is None:
+            return None
+
+        if not isinstance(value, str):
+            raise TypeError(f"{field} must be a string.")
+
+        identifier = value.strip()
+
+        if not identifier or len(identifier) > MAX_IDENTIFIER_CHARS:
+            raise ValueError(
+                f"{field} must contain 1 to {MAX_IDENTIFIER_CHARS} characters."
             )
-        except Exception as exc:
-            if state is not None and state.handle is None and state.launch_error is None:
-                state.set_launch_error(str(exc))
-            return error(named_message(display_name, str(exc)))
 
-    return handle
+        if identifier.startswith(("/", ".")) or ".." in identifier:
+            raise ValueError(f"Invalid {field}: {identifier!r}.")
+
+        if any(
+            not (char.isalnum() or char in _ALLOWED_IDENTIFIER_PUNCTUATION)
+            for char in identifier
+        ):
+            raise ValueError(f"Invalid {field}: {identifier!r}.")
+
+        return identifier
+
+    @staticmethod
+    def _validate_text(
+        value: Any,
+        field: str,
+        *,
+        required: bool,
+        max_chars: int,
+    ) -> str | None:
+        if value is None and not required:
+            return None
+
+        if not isinstance(value, str):
+            raise TypeError(f"{field} must be a string.")
+
+        text = value.strip()
+
+        if required and not text:
+            raise ValueError(f"{field} must not be empty.")
+
+        if len(text) > max_chars:
+            raise ValueError(f"{field} exceeds the {max_chars}-character limit.")
+
+        return text
+
+    @staticmethod
+    def _coerce_output_schema(
+        value: Any,
+    ) -> dict[str, Any] | None:
+        schema, schema_error = coerce_output_schema(value)
+
+        if schema_error:
+            raise ValueError(f"output_schema invalid: {schema_error}")
+
+        return schema
+
+    def _load_skill(
+        self,
+        name: str,
+        dispatch_kwargs: dict[str, Any],
+    ) -> str:
+        label = f"Skill {name!r}"
+
+        def parse(raw: Any) -> dict[str, Any]:
+            try:
+                payload = json.loads(raw) if isinstance(raw, str) else raw
+            except (
+                TypeError,
+                json.JSONDecodeError,
+            ) as exc:
+                raise ValueError(f"{label} returned a malformed response.") from exc
+
+            if not isinstance(payload, dict):
+                raise TypeError(f"{label} returned a malformed response.")
+
+            return payload
+
+        payload = parse(
+            self.ctx.dispatch_tool(
+                "skill_view",
+                {"name": name},
+                **dispatch_kwargs,
+            )
+        )
+
+        if (
+            payload.get("success") is True
+            and payload.get("dedup") is True
+            and payload.get("content_returned") is False
+            and "task_id" in dispatch_kwargs
+        ):
+            retry_kwargs = {
+                key: value for key, value in dispatch_kwargs.items() if key != "task_id"
+            }
+
+            payload = parse(
+                self.ctx.dispatch_tool(
+                    "skill_view",
+                    {"name": name},
+                    **retry_kwargs,
+                )
+            )
+
+        if payload.get("success") is not True:
+            raise ValueError(
+                f"Could not load skill {name!r}: "
+                f"{payload.get('error') or 'skill_view failed'}"
+            )
+
+        content = payload.get("content")
+
+        if not isinstance(content, str) or not content.strip():
+            raise ValueError(f"Skill {name!r} returned no content.")
+
+        return f"### Skill: {name}\n\n{content.strip()}"
+
+    def _build_skill_context(
+        self,
+        base_context: str | None,
+        skill_names: Sequence[str],
+        dispatch_kwargs: dict[str, Any],
+        *,
+        max_chars: int = MAX_SKILL_CHARS,
+    ) -> str | None:
+        if not skill_names:
+            return base_context
+
+        blocks: list[str] = []
+        total = 0
+
+        for name in skill_names:
+            block = self._load_skill(
+                name,
+                dispatch_kwargs,
+            )
+
+            total += len(block)
+
+            if total > max_chars:
+                raise ValueError(
+                    f"Requested skills exceed the "
+                    f"{max_chars}-character injection limit."
+                )
+
+            blocks.append(block)
+
+        framed = f"{_START}\n" + "\n\n".join(blocks) + f"\n{_END}"
+
+        combined = f"{base_context}\n\n{framed}" if base_context else framed
+
+        if len(combined) > MAX_TOTAL_CONTEXT_CHARS:
+            raise ValueError(
+                "Mission context plus skills exceeds Hermes' "
+                f"{MAX_TOTAL_CONTEXT_CHARS}-character lifecycle limit."
+            )
+
+        return combined
+
+    def _build_spec(
+        self,
+        params: dict[str, Any],
+        display_name: str,
+        explicit_parent: Any = None,
+    ) -> "DelegateTaskAdvanced._LaunchSpec":
+        goal = self._validate_text(
+            params.get("goal"),
+            "goal",
+            required=True,
+            max_chars=MAX_GOAL_CHARS,
+        )
+
+        assert goal is not None
+
+        if len(f"Subagent '{display_name}' — {goal}") > MAX_GOAL_CHARS:
+            raise ValueError(
+                "goal is too long once the required display-name prefix is applied."
+            )
+
+        context = self._validate_text(
+            params.get("context"),
+            "context",
+            required=False,
+            max_chars=MAX_USER_CONTEXT_CHARS,
+        )
+
+        model = self._validate_identifier(
+            params.get("model"),
+            "model",
+        )
+
+        skills = tuple(
+            self._normalize_name_list(
+                params.get("skills"),
+                "skills",
+            )
+        )
+
+        if "toolsets" in params and params.get("toolsets") == []:
+            raise ValueError(
+                "toolsets cannot be an explicit empty list; "
+                "omit it to inherit Hermes capabilities."
+            )
+
+        toolsets = tuple(
+            self._normalize_name_list(
+                params.get("toolsets"),
+                "toolsets",
+            )
+        )
+
+        output_schema = self._coerce_output_schema(params.get("output_schema"))
+
+        parent = explicit_parent
+
+        if parent is None:
+            parent = get_active_subagent_parent()
+
+        self._validate_toolsets(
+            toolsets,
+            parent,
+        )
+
+        parent_session_id = str(getattr(parent, "session_id", "") or "") or None
+
+        return self._LaunchSpec(
+            display_name=display_name,
+            goal=goal,
+            context=context,
+            model=model,
+            skills=skills,
+            toolsets=toolsets,
+            output_schema=output_schema,
+            parent_session_id=parent_session_id,
+        )
+
+    def _prepare(
+        self,
+        spec: "DelegateTaskAdvanced._LaunchSpec",
+        kwargs: dict[str, Any],
+    ) -> SubagentLaunchRequest:
+        dispatch_kwargs = {
+            key: kwargs[key]
+            for key in (
+                "task_id",
+                "session_id",
+            )
+            if kwargs.get(key) is not None
+        }
+
+        context = self._build_skill_context(
+            spec.context,
+            spec.skills,
+            dispatch_kwargs,
+        )
+
+        if spec.output_schema is not None:
+            context = append_output_contract(
+                context,
+                spec.output_schema,
+            )
+
+            if len(context) > MAX_TOTAL_CONTEXT_CHARS:
+                raise ValueError(
+                    "Mission context plus skills and "
+                    "output_schema exceeds Hermes' "
+                    f"{MAX_TOTAL_CONTEXT_CHARS}-character lifecycle limit."
+                )
+
+        correlation_id = f"dta-{uuid.uuid4().hex}"
+
+        return SubagentLaunchRequest(
+            goal=spec.wrapped_goal,
+            context=context,
+            model=spec.model,
+            allowed_toolsets=(spec.toolsets or None),
+            parent_session_id=(spec.parent_session_id),
+            correlation_id=correlation_id,
+            metadata={
+                "source_tool": TOOL_NAME,
+                "display_name": spec.display_name,
+                "requested_skills": list(spec.skills),
+                "requested_toolsets": list(spec.toolsets),
+                "requested_model": spec.model,
+                "parent_session_id": (spec.parent_session_id),
+                "correlation_id": correlation_id,
+            },
+        )
+
+    def _reserve(
+        self,
+        spec: "DelegateTaskAdvanced._LaunchSpec",
+        request: SubagentLaunchRequest,
+        state: _DeferredLaunch,
+    ) -> dict[str, Any]:
+        session_key = get_current_session_key("")
+        origin_ui_session_id = get_session_env(
+            "HERMES_UI_SESSION_ID",
+            "",
+        )
+        dispatch = dispatch_async_delegation(
+            goal=spec.wrapped_goal,
+            context=request.context,
+            toolsets=(list(spec.toolsets) or None),
+            role="leaf",
+            model=spec.model,
+            session_key=session_key,
+            parent_session_id=(spec.parent_session_id),
+            runner=state.run,
+            origin_ui_session_id=(origin_ui_session_id),
+            origin_session_id="",
+            interrupt_fn=state.cancel,
+        )
+
+        if dispatch.get("status") != "dispatched":
+            raise RuntimeError(
+                str(dispatch.get("error") or "Completion delivery rejected.")
+            )
+
+        try:
+            live_id, writers, paths = create_live_transcripts(
+                [
+                    {
+                        "goal": spec.wrapped_goal,
+                        "context": request.context,
+                    }
+                ],
+                request.context,
+                delegation_id=dispatch.get("delegation_id"),
+            )
+
+            state.live_delegation_id = live_id
+            state.writer = writers[0] if writers else None
+
+            if paths:
+                dispatch["live_transcript"] = paths[0]
+
+        # Live transcript creation is optional observability. Do not reject a
+        # successful dispatch when that auxiliary backend is unavailable.
+        except Exception as exc:  # noqa: BLE001
+            _LOGGER.debug("Could not create the live transcript: %s", exc)
+
+        return dispatch
+
+    def _launch(
+        self,
+        spec: "DelegateTaskAdvanced._LaunchSpec",
+        request: SubagentLaunchRequest,
+        state: _DeferredLaunch,
+        dispatch: dict[str, Any],
+    ) -> str:
+        payload = {
+            "success": True,
+            "name": spec.display_name,
+            "delegation_id": dispatch.get("delegation_id"),
+            "toolsets": (list(spec.toolsets) if spec.toolsets else "inherited"),
+            "skills": list(spec.skills),
+            "correlation_id": (request.correlation_id),
+            "live_transcript": dispatch.get("live_transcript"),
+        }
+
+        if not state.begin_launch():
+            payload.update(
+                status="interrupted",
+                subagent_id=None,
+                model=spec.model,
+                effective_role=None,
+                depth=None,
+                note=("Cancellation won before the lifecycle child was launched."),
+            )
+
+            return tool_result(payload)
+
+        handle = self.lifecycle.launch(request)
+
+        state.set_handle(handle)
+
+        payload.update(
+            status="launched",
+            subagent_id=handle.subagent_id,
+            model=handle.model,
+            effective_role=getattr(
+                handle,
+                "role",
+                None,
+            ),
+            depth=getattr(
+                handle,
+                "depth",
+                None,
+            ),
+            note=(
+                "Hermes derived the subagent capabilities "
+                "from the spawn depth. The result will "
+                "re-enter this conversation through the "
+                "normal background completion rail."
+            ),
+        )
+
+        return json.dumps(
+            payload,
+            ensure_ascii=False,
+        )
+
+    @staticmethod
+    def _validate_toolsets(
+        toolsets: Sequence[str],
+        parent_agent: Any,
+    ) -> None:
+        if not toolsets:
+            return
+
+        unknown = [name for name in toolsets if get_toolset(name) is None]
+
+        if unknown:
+            raise ValueError(f"Unknown toolsets: {', '.join(sorted(unknown))}.")
+
+        enabled = getattr(
+            parent_agent,
+            "enabled_toolsets",
+            None,
+        )
+
+        if enabled is not None and not set(toolsets).issubset(set(enabled)):
+            raise ValueError(
+                "Requested toolsets would broaden parent permissions. "
+                "Enable the narrow toolset for the parent platform "
+                "before selecting it."
+            )
